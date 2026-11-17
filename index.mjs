@@ -321,6 +321,21 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   //
   // 组织可能还没确定（repo 留空 → 自动发现），这时先按 token 归组，
   // 等 applyCredentials 拿到 org 后再迁移到带 org 的键上。
+  // 账号在界面/日志/工具输出里的名字。
+  // 必须带上组织：同一用户的多个组织是两个独立账号，
+  // 都显示成「ikoude」就分不清谁是谁了。
+  //
+  // runtimeOrg 传运行时识别出的组织（旧账号没存 metadata.org，靠它补）。
+  function labelOf(auth, ctx, runtimeOrg) {
+    const meta = auth?.metadata || {};
+    const name = String(
+      meta.username || meta.email || meta.repo || auth?.label || ctx?.key || '',
+    ).trim();
+    const org = String(meta.org || runtimeOrg || '').trim();
+    const label = org && name ? `${name}@${org}` : (name || ctx?.key || '');
+    return label.slice(0, 32);
+  }
+
   function orgOf(auth) {
     const meta = auth?.metadata || {};
     const fromRepo = String(meta.repo || '').includes('/')
@@ -372,6 +387,11 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         }
         return fn(ctx);
       }).catch((e) => [`执行失败：${e.message}`]);
+      // refresh 之后 cfg.repo 才可能识别出来，这时才补得上组织后缀
+      if (!String(ctx.label || '').includes('@')) {
+        const org = (ctx.cfg?.repo || '').split('/')[0];
+        if (org && ctx.label) ctx.label = `${ctx.label}@${org}`.slice(0, 32);
+      }
       const head = multi ? `【${ctx.label || ctx.key}】` : '';
       const body = Array.isArray(lines) ? lines : [String(lines)];
       return head ? [head, ...body.map((l) => `  ${l}`)].join('\n') : body.join('\n');
@@ -517,6 +537,16 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return null;
   }
 
+  // 工作区的时间字段是 create_time（不是 created_at），
+  // 兼容几种可能的写法，取不到就退回 0（保持原序）。
+  const tsOf = (w) => {
+    for (const k of ['create_time', 'createTime', 'created_at', 'updated_at']) {
+      const t = Date.parse(w?.[k] || '');
+      if (Number.isFinite(t)) return t;
+    }
+    return 0;
+  };
+
   // 同一仓库可能有多个工作区实例（每次启动/关闭都留一条）。
   // 实测一个仓库能攒到 9 条（1 running + 8 closed）。挑选顺序：
   //   1. 正在运行的 —— 直接能用，不用等冷启动
@@ -532,16 +562,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     }
     return list.sort((a, b) => tsOf(b) - tsOf(a))[0];
   }
-
-  // 工作区的时间字段是 create_time（不是 created_at），
-  // 兼容几种可能的写法，取不到就退回 0（保持原序）。
-  const tsOf = (w) => {
-    for (const k of ['create_time', 'createTime', 'created_at', 'updated_at']) {
-      const t = Date.parse(w?.[k] || '');
-      if (Number.isFinite(t)) return t;
-    }
-    return 0;
-  };
 
   // 确认仓库是否存在。用于把"仓库名填错"和"仓库在但没工作区"区分开，
   // 避免填错时一直尝试 start（会得到一串 404 且反复重试）。
@@ -1388,6 +1408,13 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         cfg.repo = picked.includes('/') || !meta.org ? picked : `${meta.org}/${picked}`;
       }
     }
+
+    // 组织此刻已确定（metadata.org 或仓库前缀），补上名字里的组织后缀。
+    // 旧账号标签只有用户名，不补的话多组织会显示成同一个人。
+    const c = cur();
+    if (c && !String(c.label || '').includes('@')) {
+      c.label = labelOf(auth, c, (cfg.repo || '').split('/')[0]);
+    }
   }
 
   // ---------- 后台轮询 ----------
@@ -1692,18 +1719,14 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         // 关键：先切到"这个账号"的作用域，后面所有 cfg/state 都只影响它。
         // magpie 会为每个账号各调一次 loader，闭包是共用的。
         const ctx = ctxFor(auth);
-        // 标记账号，让日志和工具输出能区分。用户名优先，其次 email、仓库名。
-        if (!ctx.label) {
-          ctx.label = String(
-            auth?.metadata?.username
-            || auth?.metadata?.email
-            || auth?.metadata?.repo
-            || auth?.label
-            || ctx.key,
-          ).slice(0, 20);
-        }
+        // 先给个初值（此刻还读不到 cfg.repo），拿不到组织就只是用户名
+        if (!ctx.label) ctx.label = labelOf(auth, ctx);
         return within(ctx, async () => {
           applyCredentials(auth);   // 先读凭据，再启动轮询（顺序很关键）
+          // cfg.repo 可能已经识别出来了，用它补齐组织后缀
+          if (!ctx.label.includes('@')) {
+            ctx.label = labelOf(auth, ctx, (cfg.repo || '').split('/')[0]);
+          }
           ensureTimer();
 
           // 首次调用时把权限状况说清楚（只跑一次）
@@ -1824,20 +1847,28 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         // usage 是按账号跑的，必须在对应账号作用域里算，否则会读到别人的额度
         const auth = await getAuth?.();
         const ctx = ctxFor(auth);
-        // 账号在界面上的名字：优先 CNB 用户名，其次 email，最后才退回内部键。
-        // 不返回 user 的话，宿主会拿 key 尾缀当名字（"API key …-key"），
-        // 多个账号看起来就像同一个、显示方式也不一致。
-        const accountName = String(
-          auth?.metadata?.username
-          || auth?.metadata?.email
-          || auth?.name
-          || '',
-        ).trim();
-        if (!ctx.label) ctx.label = (accountName || ctx.key).slice(0, 20);
+        if (!ctx.label) ctx.label = labelOf(auth, ctx);
         return within(ctx, async () => {
         // 必须先把凭据读进 cfg —— usage 可能先于 loader 被调用（比如刚登录、
         // 或只在界面上看额度而不发消息），缺少这步 cfg.token 就是空的。
         applyCredentials(auth);
+        if (!ctx.label.includes('@')) {
+          ctx.label = labelOf(auth, ctx, (cfg.repo || '').split('/')[0]);
+        }
+
+        // 账号在界面上的名字。必须带组织：同一用户的多个组织是两个账号，
+        // 都显示成「ikoude」就分不开了。
+        // 不返回 user 的话宿主要拿 key 尾缀当名字（"API key …-key"）。
+        const userName = String(
+          auth?.metadata?.username || auth?.metadata?.email || auth?.name || '',
+        ).trim();
+        // 旧账号没有 metadata.org，用运行时识别出的仓库前缀补
+        const authOrg = String(
+          auth?.metadata?.org || (cfg.repo || '').split('/')[0] || '',
+        ).trim();
+        const accountName = userName
+          ? (authOrg ? `${userName}@${authOrg}` : userName)
+          : '';
         // usage 是登录/打开插件界面时最早被调的钩子，顺势主动拉一次。
         if (!state.uri) {
           await kick('usage-first').catch(() => {});
