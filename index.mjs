@@ -1291,6 +1291,11 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   // 登录时选的结束标记，跟在组织列表末尾表示"不再加了"
   const ORGS_DONE = '__done__';
 
+  // 仓库下拉里的「手动填写」选项。候选是拿日志筛出来的（只看有没有
+  // PROXY_URI），日志没拉到、或仓库刚建还没跑过，就筛不出来 —— 所以
+  // 永远留一个自己填的口子，不能把用户卡在候选列表里。
+  const REPO_MANUAL = '__manual__';
+
   // 把 inputs.orgs 拆成 { list, done }。
   // 答案是一串逗号分隔的组织，末尾可能带 __done__ —— 用单个字面量
   // 承载整个状态，是因为宿主只会把「真正弹出来过的问题」的答案交回来，
@@ -1310,12 +1315,12 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     const out = [];
     for (const org of parseOrgAnswers(inputs?.orgs).list) {
       const raw = normalizeRepo(inputs?.[`repo@${org}`]) || '';
-      if (!raw) continue;
+      if (!raw || raw === REPO_MANUAL) continue;
       out.push({ org, repo: raw.includes('/') ? raw : `${org}/${raw}` });
     }
     if (!out.length) {
       const raw = normalizeRepo(inputs?.repo) || '';
-      if (raw) {
+      if (raw && raw !== REPO_MANUAL) {
         const org = String(inputs?.org || '').trim() || raw.split('/')[0] || '';
         out.push({ org, repo: raw.includes('/') || !org ? raw : `${org}/${raw}` });
       }
@@ -1423,7 +1428,26 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   // PROXY_URI 只能说明"这个仓库跑过"，说明不了用户想用哪个 —— 自动选中
   // 错了，地址、账号、巡检就全挂到别的仓库上去了。所以哪怕只有一个候选，
   // 也照样列出来让用户确认。
-  const needRepo = picked.list.find((o) => !normalizeRepo(inputs[`repo@${o}`]));
+
+  // 上一轮选了下拉里最后那条「手动填写」→ 换成文本框。
+  // 候选是筛出来的（日志里得有 PROXY_URI），漏筛很正常（仓库刚建、
+  // 日志已滚掉），所以永远给用户留一条自己填的路。
+  const manualOrg = picked.list.find(
+    (o) => String(inputs[`repo@${o}`] || '').trim() === REPO_MANUAL,
+  );
+  if (manualOrg) {
+    return {
+      type: 'text',
+      key: `repo@${manualOrg}`,
+      message: `手动填写 ${manualOrg} 下的仓库名（跑着 cnb2api 的那个）`,
+      placeholder: '例如 cnb2api，或 org/repo（不填组织就按上面选的）',
+    };
+  }
+
+  const needRepo = picked.list.find((o) => {
+    const v = normalizeRepo(inputs[`repo@${o}`]) || '';
+    return !v || v === REPO_MANUAL;
+  });
   if (needRepo) {
     const found = await listCnbReposForLogin(token, needRepo).catch(() => null);
     if (!found) {
@@ -1448,13 +1472,20 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       type: 'select',
       key: `repo@${needRepo}`,
       message: found.length === 1
-        ? `确认仓库（${needRepo} 下只有这 1 个跑着 cnb2api）`
+        ? `确认仓库（${needRepo} 下只有这 1 个跑着 cnb2api，选它或手动填）`
         : `选择仓库（${needRepo} 下有 ${found.length} 个在跑 cnb2api）`,
-      options: found.map((r) => ({
-        label: r.repo,
-        value: r.repo,
-        hint: r.running ? '运行中' : '已停止',
-      })),
+      options: [
+        ...found.map((r) => ({
+          label: r.repo,
+          value: r.repo,
+          hint: r.running ? '运行中' : '已停止',
+        })),
+        {
+          label: '手动填写仓库名…',
+          value: REPO_MANUAL,
+          hint: '候选里没有你要的那个（没跑过、或日志已滚掉）',
+        },
+      ],
     };
   }
 
@@ -1494,12 +1525,21 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     };
   }
 
-  // 5) PROXY_KEY（多个账号共用同一个，它属于网关不属于账号）
+  // 5) PROXY_KEY
+  //
+  // 这个**必须手填，没有任何"自动获取"的可能**：它只是你自己 .cnb.yml 里
+  // env 的一个值，CNB 的 OpenAPI 读不到工作区的 env（能读到就等于谁拿到
+  // 令牌都能读别人的密钥）。所以登录流程的最后一步一定问它。
+  //
+  // 一次登录加多个账号时也只问一次：PROXY_KEY 属于网关，不属于账号，
+  // 同一份 .cnb.yml 起的 cnb2api 用的是同一个 key，所有账号共用。
   if (!inputs.proxyKey) {
     return {
       type: 'password',
       key: 'proxyKey',
-      message: 'PROXY_KEY（你自己 .cnb.yml 里设的那个，通常 sk- 开头）',
+      message: picked.list.length > 1
+        ? `PROXY_KEY（.cnb.yml 里的那个，通常 sk- 开头）—— ${picked.list.length} 个账号共用这一个，只问一次`
+        : 'PROXY_KEY（你自己 .cnb.yml 里设的那个，通常 sk- 开头）',
       placeholder: 'sk-…',
     };
   }
@@ -1655,7 +1695,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             ];
             if (repos && repos.length) {
               notes.push(`名下有 ${repos.length} 个仓库：${repos.slice(0, 8).join('、')}`
-                + `${repos.length > 8 ? ' 等' : ''}（插件会自动识别哪个跑着 cnb2api）`);
+                + `${repos.length > 8 ? ' 等' : ''}（只是列出来看看，用哪个由你在下一步选）`);
             }
             say(`登录成功：\n  ${notes.join('\n  ')}`);
 
