@@ -230,6 +230,11 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   // ---------------------------------------------------------------------------
   const ctxs = new Map();          // key → ctx
 
+  // 本次进程里已经配过账号的组织。只用于登录流程的提示：
+  // 用户可以用同一个令牌分几次登录、每次只加一个组织（不想一次加太多），
+  // 这时把加过的组织在选项里标出来，避免重复添加同一个组合。
+  const seenOrgs = new Set();
+
   // 用 AsyncLocalStorage 而不是"栈式 current"：
   // 定时器回调会在任意 await 点插入执行，栈式变量会被别的账号覆盖。
   // ALS 跟随异步调用链传递，天然隔离。
@@ -292,15 +297,23 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   // 只按 token 分的话，同一账号下的两个组织会共用一份 ctx，
   // 后填的组织把先填的覆盖掉，两个组织的额度显示成同一份。
   //
-  // 账号在界面/日志/工具输出里的名字：<用户>@<组织/仓库>。
+  // 账号在界面/日志/工具输出里的名字：<用户> | <组织>/<仓库>。
+  //
+  // 用 " | " 分隔用户和组织：组织/仓库 里已经有一个 "/"，再加 "@" 会变成
+  // "alice@acme/gateway" 这种和邮箱撞脸的写法，看多了分不清哪是用户哪是组织。
+  // 组织与仓库之间固定用 "/"（CNB 自己的写法，org/repo）。
+  //
   // 粒度取到仓库 —— 同组织下两个仓库是两个账号，只写用户名或组织都分不出来。
   function labelOf(auth, ctx) {
     const meta = auth?.metadata || {};
-    const name = String(
-      meta.username || meta.email || auth?.label || ctx?.key || '',
-    ).trim();
+    const name = String(meta.username || '').trim();
+    // email 本身就已经是 "用户 | 组织/仓库" 的形态（去掉了 @cnb.cool），
+    // 没有 username 时直接用它，不能再拼一次 repo，否则会重复一截。
+    const fromEmail = String(meta.email || '').replace(/@cnb\.cool$/i, '').trim();
     const repo = String(meta.repo || '').trim();
-    const label = repo && name ? `${name}@${repo}` : (name || ctx?.key || '');
+    const label = repo && name
+      ? `${name} | ${repo}`
+      : (name || fromEmail || auth?.label || ctx?.key || '');
     return label.slice(0, 48);
   }
 
@@ -1387,11 +1400,19 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return {
       type: 'select',
       key: 'orgs',
-      message: `选择组织（共 ${orgs.length} 个，每个组织是一个独立账号）`,
+      message: only
+        ? `选择组织（令牌只属于 ${orgs[0]} 这一个）`
+        : `选择组织（共 ${orgs.length} 个，每个组织是一个独立账号）`,
       options: orgs.slice(0, 40).map((o) => ({
         label: o,
         value: only ? `${o},${ORGS_DONE}` : o,
-        hint: only ? '只有这一个，选完直接下一步' : '',
+        // 连加多个只是为了少贴几次令牌，不是必须。只加这一个、剩下的
+        // 以后再登一次照样行（同一份令牌重复贴而已），所以提示写清楚。
+        hint: only
+          ? '只有这一个，选完直接下一步'
+          : (seenOrgs.has(o)
+            ? '之前加过账号（同组织同仓库会覆盖原来那条）'
+            : '选完可以继续加别的，也可以就加这一个'),
       })),
     };
   }
@@ -1449,7 +1470,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       return r.includes('/') ? r : `${o}/${r}`;
     });
     const options = [{
-      label: '就这些，继续',
+      // 只加一个组织、且想一次收工时这就是唯一的路 —— 标签说直白点
+      label: picked.list.length === 1 ? '就这些，继续（只加这 1 个）' : '就这些，继续',
       value: `${picked.list.join(',')},${ORGS_DONE}`,
       hint: `将添加 ${picked.list.length} 个账号：${full.join('、')}`,
     }];
@@ -1457,14 +1479,16 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       options.push({
         label: `再添加 ${o}`,
         value: `${picked.list.join(',')},${o}`,
-        hint: `接着选 ${o} 下的仓库`,
+        hint: seenOrgs.has(o)
+          ? `已加过 ${o} 的账号，再加就是同组织下的另一个仓库`
+          : `接着选 ${o} 下的仓库`,
       });
     }
     return {
       type: 'select',
       key: 'orgs',
       message: rest.length
-        ? '还要添加其他组织吗？（额度按组织算，每个组织是独立账号）'
+        ? '还要添加其他组织吗？（令牌只贴这一次；点「就这些」就只加上面这些）'
         : '组织都配好了，确认一下：',
       options,
     };
@@ -1618,14 +1642,20 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             }
 
             // ---- 3. 顺手把这个账号名下的仓库列出来，方便用户确认 ----
+            //
+            // 显示名统一成 "用户 | 组织/仓库"（分隔符用 " | "，不用 "@"：
+            // 组织/仓库 里已经有 "/"，再加 "@" 会变成和邮箱撞脸的
+            // "alice@acme/gateway"，看不出哪边是用户、哪边是组织）。
+            const displayOf = (t) => `${username || uid} | ${t.repo}`;
+
             const repos = await listReposForLogin(token).catch(() => null);
-            const notes = [`账号：${username || uid}`];
+            const notes = [
+              `账号：${username || uid}`,
+              `将添加：${targets.map(displayOf).join('、')}`,
+            ];
             if (repos && repos.length) {
               notes.push(`名下有 ${repos.length} 个仓库：${repos.slice(0, 8).join('、')}`
                 + `${repos.length > 8 ? ' 等' : ''}（插件会自动识别哪个跑着 cnb2api）`);
-            }
-            if (targets.length > 1) {
-              notes.push(`本次添加 ${targets.length} 个账号：${targets.map((t) => t.repo).join('、')}`);
             }
             say(`登录成功：\n  ${notes.join('\n  ')}`);
 
@@ -1638,7 +1668,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               proxyKey,
               uid,
               username: username || undefined,
-              email: `${username || uid}+${t.repo}@cnb.cool`,
+              // 身份串保持和显示名一致；@cnb.cool 只是让它在列表里看得出是 CNB 账号
+              email: `${displayOf(t)}@cnb.cool`,
               org: t.org || undefined,
               repo: t.repo || undefined,
             });
@@ -1646,9 +1677,16 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             const all = targets.map(metaOf);
             const mine = all[0];
 
+            // 记下这次配到过哪些组织，供下一次登录时在选项里做提示
+            for (const t of targets) if (t.org) seenOrgs.add(t.org);
+
             // 宿主的登录流程一次只落一个账号（save 写一条），所以第二个
             // 组织起由插件自己写进账号表 —— 否则用户有几个组织就得重登几次、
             // 把令牌反复粘几遍。
+            //
+            // 注意：这是**可选**的省事路径。用户完全可以每次只加一个组织，
+            // 分几次登录（各自贴一次令牌），结果完全一样 —— 见 askNext 里
+            // 「就这些，继续」那条分支。
             if (all.length > 1) {
               const { unsupported, failed } = await adoptAccounts(all.slice(1));
               if (unsupported) {
@@ -1668,7 +1706,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               // 真正决定身份的是 metadata.email，所以它必须唯一。
               accountId: `cnb:${uid}:${mine.repo}`,
               uid: `cnb:${uid}:${mine.repo}`,
-              name: `${username || uid}@${mine.repo}`,
+              name: displayOf(mine),
               metadata: mine,
             };
           },
@@ -1802,16 +1840,17 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         // 或只在界面上看额度而不发消息），缺少这步 cfg.token 就是空的。
         applyCredentials(auth);
 
-        // 账号在界面上的名字。粒度到「组织/仓库」：同组织下两个仓库
-        // 是两个账号，只写用户名或只写组织都分不开。
+        // 账号在界面上的名字。格式 "用户 | 组织/仓库"：粒度到仓库，
+        // 同组织下两个仓库是两个账号，只写用户名或只写组织都分不开。
         // 不返回 user 的话宿主要拿 key 尾缀当名字（"API key …-key"）。
-        const userName = String(
-          auth?.metadata?.username || auth?.metadata?.email || auth?.name || '',
-        ).trim();
+        const userName = String(auth?.metadata?.username || '').trim();
         const authRepo = String(auth?.metadata?.repo || '').trim();
+        // email 已经是 "用户 | 组织/仓库"（去掉 @cnb.cool），没有 username
+        // 时直接用，别再把 repo 拼一次
+        const fromEmail = String(auth?.metadata?.email || '').replace(/@cnb\.cool$/i, '').trim();
         const accountName = userName
-          ? (authRepo ? `${userName}@${authRepo}` : userName)
-          : '';
+          ? (authRepo ? `${userName} | ${authRepo}` : userName)
+          : fromEmail;
         // usage 是登录/打开插件界面时最早被调的钩子，顺势主动拉一次。
         if (!state.uri) {
           await kick('usage-first').catch(() => {});

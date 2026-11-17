@@ -63,17 +63,19 @@ magpie plugin login cnb2api
 
 ```
 ① CNB 访问令牌（CNB → 头像 → 访问令牌）        ← 手填
-② 选择组织（共 3 个）
+② 选择组织（共 3 个，每个组织是一个独立账号）
      acme │ bob │ alice                       ← 下拉
 ③ 确认仓库（acme 下有 2 个在跑 cnb2api）
      acme/my-gateway (运行中) │ acme/other-api (已停止)
-④ 还要添加其他组织吗？
-     就这些，继续 │ 再添加 bob │ 再添加 alice
+④ 还要添加其他组织吗？（令牌只贴这一次）
+     就这些，继续（只加这 1 个） │ 再添加 bob │ 再添加 alice
 ⑤ PROXY_KEY（.cnb.yml 里设的那个）              ← 手填
 ```
 
 ④ 选了「再添加 bob」就回到 ③ 给 bob 选仓库，然后再问一次 ④，
 直到点「就这些，继续」。令牌和 PROXY_KEY 各填一次就够。
+只加一个组织也走同一条路——③ 选完仓库，④ 直接点
+「就这些，继续（只加这 1 个）」，剩下的组织以后再登一次就行。
 
 几条不省的规矩：
 
@@ -164,6 +166,16 @@ magpie plugin login cnb2api
 所以插件把身份定义为 **(用户, 组织/仓库)**：
 不同组织额度不同；同组织不同仓库额度相同、但地址不同。
 
+账号在界面、日志、工具输出里的名字统一是 **`用户 | 组织/仓库`**：
+
+```
+alice | acme/gateway
+```
+
+竖线分隔「用户」和「组织」，组织与仓库之间用 `/`（CNB 自己的写法 `org/repo`）。
+不用 `alice@acme/gateway` 这种写法：`组织/仓库` 里本来就有 `/`，再加一个 `@`
+看起来像邮箱，读起来分不清哪边是用户、哪边是组织。
+
 > **PROXY_KEY 不参与身份判定。** 它是 api 类型的 apiKey，很多人图省事
 > 多个账号填同一个 `sk-xxx`。一旦拿它当身份，不管组织和仓库怎么选，
 > 所有登录都会被认成同一个账号，列表里永远只有一条。
@@ -174,8 +186,8 @@ magpie plugin login cnb2api
 **① 多个独立账号，各看各的组织**
 
 ```
-alice@acme/gateway      ← alice 的令牌，acme 组织的额度
-bob@beta/proxy          ← bob 的令牌，beta 组织的额度
+alice | acme/gateway    ← alice 的令牌，acme 组织的额度
+bob   | beta/proxy      ← bob 的令牌，beta 组织的额度
 ```
 
 两个账号的额度、地址、巡检完全独立。多个账号共用同一个 PROXY_KEY 也没问题。
@@ -186,8 +198,8 @@ bob 被加进 acme 并把令牌也给了你——两个账号看到的是 acme �
 但工作区归属各自的令牌：
 
 ```
-alice@acme/gateway      ← 用 alice 的令牌
-bob@acme/gateway        ← 用 bob 的令牌
+alice | acme/gateway    ← 用 alice 的令牌
+bob   | acme/gateway    ← 用 bob 的令牌
 ```
 
 想用哪个账号就在 magpie 里切哪个。**不要指望一个账号同时用两个组织的额度**
@@ -198,8 +210,8 @@ bob@acme/gateway        ← 用 bob 的令牌
 alice 同时是 acme、gamma 的成员，每个组织各有独立额度和工作区：
 
 ```
-alice@acme/gateway      → 额度 1166，地址 7mzc****-9001.cnb.run
-alice@gamma/gateway     → 额度 500， 地址 xmjq****-9001.cnb.run
+alice | acme/gateway    → 额度 1166，地址 7mzc****-9001.cnb.run
+alice | gamma/gateway   → 额度 500， 地址 xmjq****-9001.cnb.run
 ```
 
 **④ 同组织下多个仓库**
@@ -207,15 +219,22 @@ alice@gamma/gateway     → 额度 500， 地址 xmjq****-9001.cnb.run
 alice 在 acme 下有两个都跑着 cnb2api 的仓库：
 
 ```
-alice@acme/gateway-a    → 额度 1166（共享），地址 7mzc****-9001.cnb.run
-alice@acme/gateway-b    → 额度 1166（共享），地址 ab12****-9001.cnb.run
+alice | acme/gateway-a  → 额度 1166（共享），地址 7mzc****-9001.cnb.run
+alice | acme/gateway-b  → 额度 1166（共享），地址 ab12****-9001.cnb.run
 ```
 
 额度是同一个（都属 acme），但地址和巡检完全独立——这样才能分别拉起。
 
-③ 和 ④ 都不用重登：一次登录里可以连着加，每选完一个组织会问
-「还要添加其他组织吗」，点「再添加 xxx」就继续，加完点「就这些，继续」。
-令牌只粘一次。
+③ 和 ④ 有两种加法，结果完全一样，随便挑：
+
+| 加法 | 怎么做 | 适合 |
+|---|---|---|
+| **一次加多个** | 一次登录里连着加，每选完一个组织会问「还要添加其他组织吗」，点「再添加 xxx」继续，加完点「就这些，继续」 | 令牌只贴一次，最省事 |
+| **一次加一个** | 每次登录只选一个组织，选完点「就这些，继续」，下次再跑一遍 `login` | 想一个一个核对，或先加一个用着 |
+
+一次加多个只是为了**少贴几次令牌**，不是必须的。分几次登录时每份令牌
+各贴一次，账号身份由「用户 + 组织/仓库」决定，跟是不是同一次登录无关；
+同一个组合重复登录只会覆盖原来那条，不会越登越多。
 
 ### 怎么登录
 
@@ -236,6 +255,11 @@ magpie plugin login cnb2api
 
 一次登录就把三个组织全加好了。中间每一步都能选「就这些，继续」提前收工，
 所以只想要其中两个的话，加完第二个就停。
+
+**只加一个也完全 OK。** 选完组织和仓库，那一步会写成
+「就这些，继续（只加这 1 个）」，点它直接进 PROXY_KEY，登录结束——
+剩下的组织想加的时候再跑一次 `magpie plugin login cnb2api` 就行。
+那次会把令牌再贴一遍，这是唯一的代价，账号本身没有区别。
 
 换账号（另一个人的令牌）才需要重新跑一次 `login`：
 
@@ -276,11 +300,14 @@ acme/my-ai-gateway   日志: "PROXY_URI=https://ab12-..."    → 候选之一
 
 ```
 CNB2API · running
-  ikoude  workspace      ok · 860l****-9001.cnb.run                     (aside)
-          AI credits     ▓▓▓▓▓▓▓░░░  801.1 / 1166 cr   天才程序员专属特权 +666 · 冻结 0 · 可用 364.9
-  qdirs   workspace      ok · o0iw****-9001.cnb.run                     (aside)
-          AI credits     ░░░░░░░░░░  0 / 1166 cr       天才程序员专属特权 +666 · 冻结 96.2 · 可用 1069.8
+  ikoude | ikoude/cnb2api   workspace     ok · 860l****-9001.cnb.run         (aside)
+                            AI credits    ▓▓▓▓▓▓▓░░░  801.1 / 1166 cr   天才程序员专属特权 +666 · 冻结 0 · 可用 364.9
+  qdirs  | qdirs/cnb2api    workspace     ok · o0iw****-9001.cnb.run         (aside)
+                            AI credits    ░░░░░░░░░░  0 / 1166 cr       天才程序员专属特权 +666 · 冻结 96.2 · 可用 1069.8
 ```
+
+第一列就是账号名 `用户 | 组织/仓库`。多个组织、多个仓库时，
+光看用户名或光看组织都分不清是哪一条，带上仓库才唯一。
 
 ### workspace 那一行
 
@@ -410,8 +437,8 @@ magpie quota             # 看当前额度
 日志里的账号前缀让你分清是谁：
 
 ```
-[ikoude/cnb2api] 已就绪：https://860lo2zlkf-9001.cnb.run
-[qdirs/cnb2api]  已就绪：https://o0iwd9t7ek-9001.cnb.run
+[ikoude | ikoude/cnb2api] 已就绪：https://860lo2zlkf-9001.cnb.run
+[qdirs | qdirs/cnb2api]   已就绪：https://o0iwd9t7ek-9001.cnb.run
 ```
 
 常见现象：
