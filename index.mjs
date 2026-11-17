@@ -318,8 +318,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   // 只按 token 分的话，同一账号下的两个组织会共用一份 ctx，
   // 后填的组织把先填的覆盖掉，两个组织的额度显示成同一份。
   //
-  // 组织可能还没确定（repo 留空 → 自动发现），这时先按 token 归组，
-  // 等 applyCredentials 拿到 org 后再迁移到带 org 的键上。
   // 账号在界面/日志/工具输出里的名字：<用户>@<组织/仓库>。
   // 粒度取到仓库 —— 同组织下两个仓库是两个账号，只写用户名或组织都分不出来。
   function labelOf(auth, ctx) {
@@ -339,19 +337,26 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return r.includes('/') ? r : '';
   }
 
-  // ctx 的键 = (token 指纹, 组织/仓库)。
+  // ctx 的键 = (CNB 账号, 组织, 仓库)。
   //
   // 三类信息的粒度不同：
   //   账号区分 / 工作区地址 → 用户 | 组织/仓库
   //   额度                  → 用户 | 组织
   //
-  // 所以键取到仓库这一层：同组织下跑两个 cnb2api 仓库时，
-  // 地址和巡检各管各的；额度天然只跟组织走，两个仓库显示同一份
-  // —— 这是正确的，计费主体就是组织。
+  // **绝不能用 PROXY_KEY 参与身份判定**：api 类型下 auth.key 就是那个
+  // sk-xxx，多个账号通常填的是同一个，一旦掺进来，不管组织/仓库怎么选
+  // 都会被归并成同一个账号。所以这里只认 CNB 令牌（meta.token + uid）。
   function keyOf(auth) {
     const meta = auth?.metadata || {};
-    const token = String(meta.token || auth?.key || auth?.access || '').trim();
-    return `${fp(token)}@${repoOf(auth)}`;
+    // oauth 类型没有 metadata.token，此时 access 是令牌；api 类型下
+    // auth.key 是 PROXY_KEY，不能拿它当身份，只能作为最后兜底的一部分。
+    const token = String(meta.token || (auth?.type === 'oauth' ? auth?.access : '') || '').trim();
+    const who = token
+      ? fp(token)
+      : `u${String(meta.uid || meta.username || 'anonymous').trim()}`;
+    const repo = repoOf(auth);
+    const org = String(meta.org || repo.split('/')[0] || '').trim();
+    return `${who}@${org}/${repo}`;
   }
 
   function ctxFor(auth) {
@@ -1549,7 +1554,10 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             const proxyKey = (inputs?.proxyKey || '').trim();
             // ask() 里选了组织/仓库就存下来；用户没选（自动跳过）就留给自动识别
             const org = (inputs?.org || '').trim();
-            const repo = normalizeRepo(inputs?.repo) || '';
+            // 只填了仓库名（没带组织）时用上面选的组织补全，
+            // 否则 metadata.repo 只有半截，地址和账号都会对不上
+            const rawRepo = normalizeRepo(inputs?.repo) || '';
+            let repo = rawRepo && !rawRepo.includes('/') && org ? `${org}/${rawRepo}` : rawRepo;
             if (!token) return { type: 'failed', error: '请填写 CNB 访问令牌' };
             if (!proxyKey) return { type: 'failed', error: '请填写 PROXY_KEY' };
 
@@ -1608,7 +1616,22 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               };
             }
 
-            // ---- 2. 顺手把这个账号名下的仓库列出来，方便用户确认 ----
+            // ---- 2. 仓库可能没传到这里，补救一次 ----
+            //
+            // ask() 在「组织下只查到 1 个候选仓库」时会直接跳过这一问，
+            // 把答案写在它自己的 inputs 里继续问下一个问题 —— 宿主只收集
+            // 它真正问过的那几栏，所以 repo 到不了这里。结果是 metadata
+            // 里没有 repo，账号身份退化成「用户+组织」，同组织的多个仓库
+            // 全被并成一个（也正是之前所有登录看起来都只登了一个的原因）。
+            if (!repo && org) {
+              const found = await listCnbReposForLogin(token, org).catch(() => null);
+              if (found && found.length === 1) {
+                repo = found[0].repo;
+                say(`组织 ${org} 下只有 ${repo} 跑着 cnb2api，按它登录`);
+              }
+            }
+
+            // ---- 3. 顺手把这个账号名下的仓库列出来，方便用户确认 ----
             const repos = await listReposForLogin(token).catch(() => null);
             const notes = [`账号：${username || uid}`];
             if (repos && repos.length) {
@@ -1617,25 +1640,35 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             }
             say(`登录成功：\n  ${notes.join('\n  ')}`);
 
+            // 账号身份 = (CNB 用户, 组织, 仓库)。三段都写进去，且**不含
+            // PROXY_KEY**：多个账号通常填的是同一个 sk-xxx，只要掺进 key，
+            // 不管组织/仓库怎么选都会被判成同一个账号（magpie 靠身份相同
+            // 来决定「替换已有账号」还是「新增一个」）。
+            //
+            // 缺组织/仓库时用 `-` 占位，不能留空 —— 留空会退化成
+            // `ikoude+@cnb.cool` 这种，几个人、几个组织全都撞在一起。
+            // repo 本身已经带组织（org/repo），别再拼一次
+            const scope = repo
+              ? (repo.includes('/') ? repo : `${org || '-'}/${repo}`)
+              : `${org || '-'}/-`;
+            const accountId = `cnb:${uid}:${scope}`;
+
             return {
               type: 'success',
               // key 存 proxyKey：magpie 会把它当 apiKey 发给 cnb2api
               key: proxyKey,
-              // api 类型的登录只保留 type/key/metadata，顶层字段会被丢弃。
-              // 账号身份标识必须放在 metadata.email：多个账号常共用同一个
-              // proxyKey，仅凭 key 无法区分，会被合并成一个账号。
-              accountId: `cnb:${uid}`,
-              uid: `cnb:${uid}`,
-              name: username || uid,
+              // api 类型只保留 type/key/metadata，顶层字段多会被丢弃；
+              // 真正决定身份的是 metadata.email，所以它必须唯一。
+              accountId,
+              uid: accountId,
+              name: `${username || uid}@${scope}`,
               metadata: {
                 token,
                 proxyKey,
                 uid,
                 username: username || undefined,
-                // 账号身份标识，粒度取到组织/仓库：
-                // 额度按组织算、地址按仓库算，所以同组织下两个仓库
-                // 必须是两个独立账号，否则地址会互相覆盖。
-                email: `${username}+${repo}@cnb.cool`,
+                // 身份标识，粒度到「组织/仓库」：额度按组织、地址按仓库。
+                email: `${username || uid}+${scope}@cnb.cool`,
                 // 下拉里选定的组织/仓库
                 org: org || undefined,
                 repo: repo || undefined,
