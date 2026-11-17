@@ -1275,6 +1275,67 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return tick(cur());
   }
 
+  // 登录时选的结束标记，跟在组织列表末尾表示"不再加了"
+  const ORGS_DONE = '__done__';
+
+  // 把 inputs.orgs 拆成 { list, done }。
+  // 答案是一串逗号分隔的组织，末尾可能带 __done__ —— 用单个字面量
+  // 承载整个状态，是因为宿主只会把「真正弹出来过的问题」的答案交回来，
+  // 插件往 inputs 里补的字段到下一步就没了。
+  function parseOrgAnswers(v) {
+    const raw = String(v || '').split(',').map((s) => s.trim()).filter(Boolean);
+    return {
+      list: raw.filter((o) => o !== ORGS_DONE),
+      done: raw.includes(ORGS_DONE),
+    };
+  }
+
+  // 从已答内容里取出「这次要添加哪些 (组织, 仓库)」。
+  // 正常路径读 orgs / repo@<org>；静态 prompts 那条路（OpenCode 不认 ask）
+  // 只有单个 org + repo，一并兼容。
+  function targetsOf(inputs) {
+    const out = [];
+    for (const org of parseOrgAnswers(inputs?.orgs).list) {
+      const raw = normalizeRepo(inputs?.[`repo@${org}`]) || '';
+      if (!raw) continue;
+      out.push({ org, repo: raw.includes('/') ? raw : `${org}/${raw}` });
+    }
+    if (!out.length) {
+      const raw = normalizeRepo(inputs?.repo) || '';
+      if (raw) {
+        const org = String(inputs?.org || '').trim() || raw.split('/')[0] || '';
+        out.push({ org, repo: raw.includes('/') || !org ? raw : `${org}/${raw}` });
+      }
+    }
+    return out;
+  }
+
+  // 一次登录里除第一个以外的账号，由插件直接写进 magpie 的账号表。
+  //
+  // 宿主的登录流程一次只 settle 一条（save 写一个 key），多组织用户就得
+  // 为每个组织重登一遍、把令牌反复粘。client.auth.set 是 OpenCode SDK 的
+  // 公开接口，插件可以自行补写；key 取身份的指纹，同一个「用户+组织/仓库」
+  // 再登一次是覆盖自己，不会越登越多。
+  async function adoptAccounts(list) {
+    const set = client?.auth?.set;
+    // 老版本 magpie 没给这个接口：如实说一声，别让用户以为都加上了
+    if (typeof set !== 'function') {
+      return { unsupported: true, failed: list.map((m) => m.email) };
+    }
+    const failed = [];
+    for (const md of list) {
+      try {
+        await set({
+          path: { id: `cnb2api#${fp(`acct:${md.email}`)}` },
+          body: { type: 'api', key: md.proxyKey, metadata: md },
+        });
+      } catch {
+        failed.push(md.email);
+      }
+    }
+    return { unsupported: false, failed };
+  }
+
   // 动态提问：先选组织、再选仓库，全部用真实数据做成下拉。
   // 宿主调用时 this 不一定指向 methods 对象，所以抽成独立函数。
   async function askNext(inputs = {}) {
@@ -1299,32 +1360,39 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     };
   }
 
-  // 2) 组织（用令牌查出真实的组织列表）
-  if (!inputs.org) {
+  // 2) 组织：一次登录可以连着加多个
+  //
+  // 一个令牌通常能访问好几个组织，而额度按组织算，每个组织都得有独立账号。
+  // 以前一次登录只能加一个，有几个组织就要重登几次、把令牌粘几次。
+  //
+  // 状态全部放在 inputs 里、由用户的回答推进：宿主只收集「真正弹出来过
+  // 的问题」的答案，插件自己递归塞进去的值会被丢掉（这正是之前 repo
+  // 丢过、账号合并过的根因）。所以这里不用递归，改用一串答案推进状态机：
+  //   inputs.orgs           逗号分隔的组织，末尾带 __done__ 表示不再加了
+  //   inputs['repo@' + org] 该组织选定的仓库
+  const picked = parseOrgAnswers(inputs.orgs);
+  if (!picked.list.length) {
     const orgs = await listOrgsForLogin(token).catch(() => null);
     if (!orgs || !orgs.length) {
       // 查不到就退回手填，不让流程卡死
       return {
         type: 'text',
-        key: 'org',
+        key: 'orgs',
         message: '组织（自动查询失败，请手动填写你的 CNB 组织名）',
         placeholder: '例如 alice',
       };
     }
-    const opts = orgs.slice(0, 40).map((o) => ({
-      label: o,
-      value: o,
-      hint: '',
-    }));
-    // 只有一个组织就不打扰用户了：直接返回仓库那一步（递归跳过组织）
-    if (opts.length === 1) {
-      return askNext({ ...inputs, org: opts[0].value });
-    }
+    // 只有 1 个组织时不必再问「还要加吗」，答案里直接带上结束标记
+    const only = orgs.length === 1;
     return {
       type: 'select',
-      key: 'org',
-      message: `选择组织（共 ${opts.length} 个）`,
-      options: opts,
+      key: 'orgs',
+      message: `选择组织（共 ${orgs.length} 个，每个组织是一个独立账号）`,
+      options: orgs.slice(0, 40).map((o) => ({
+        label: o,
+        value: only ? `${o},${ORGS_DONE}` : o,
+        hint: only ? '只有这一个，选完直接下一步' : '',
+      })),
     };
   }
 
@@ -1334,14 +1402,15 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   // PROXY_URI 只能说明"这个仓库跑过"，说明不了用户想用哪个 —— 自动选中
   // 错了，地址、账号、巡检就全挂到别的仓库上去了。所以哪怕只有一个候选，
   // 也照样列出来让用户确认。
-  if (!inputs.repo) {
-    const found = await listCnbReposForLogin(token, inputs.org).catch(() => null);
+  const needRepo = picked.list.find((o) => !normalizeRepo(inputs[`repo@${o}`]));
+  if (needRepo) {
+    const found = await listCnbReposForLogin(token, needRepo).catch(() => null);
     if (!found) {
       // 查询失败：手填，但不能留空
       return {
         type: 'text',
-        key: 'repo',
-        message: '仓库（自动查询失败，请手动填写，例如 org/my-gateway）',
+        key: `repo@${needRepo}`,
+        message: `${needRepo} 下用哪个仓库（自动查询失败，请手动填写，例如 org/my-gateway）`,
         placeholder: 'org/repo 或仓库名',
       };
     }
@@ -1349,17 +1418,17 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       // 组织里没查到，仍然要求填 —— 可能是刚建的仓库、或日志还没出现
       return {
         type: 'text',
-        key: 'repo',
-        message: `组织 ${inputs.org} 下没查到跑着 cnb2api 的仓库，请手动填写仓库名`,
+        key: `repo@${needRepo}`,
+        message: `组织 ${needRepo} 下没查到跑着 cnb2api 的仓库，请手动填写仓库名`,
         placeholder: '例如 cnb2api（可只写仓库名，组织用上面选的）',
       };
     }
     return {
       type: 'select',
-      key: 'repo',
+      key: `repo@${needRepo}`,
       message: found.length === 1
-        ? `确认仓库（${inputs.org} 下只有这 1 个跑着 cnb2api）`
-        : `选择仓库（${inputs.org} 下有 ${found.length} 个在跑 cnb2api）`,
+        ? `确认仓库（${needRepo} 下只有这 1 个跑着 cnb2api）`
+        : `选择仓库（${needRepo} 下有 ${found.length} 个在跑 cnb2api）`,
       options: found.map((r) => ({
         label: r.repo,
         value: r.repo,
@@ -1368,7 +1437,40 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     };
   }
 
-  // 4) PROXY_KEY
+  // 4) 还要加别的组织吗
+  //
+  // 已经配好仓库的组织在提示里列出来，让用户看得见「现在要加的是哪几个」。
+  // 答案仍然写回 orgs，末尾补上 __done__ 就表示收工。
+  if (!picked.done) {
+    const all = (await listOrgsForLogin(token).catch(() => null)) || [];
+    const rest = all.filter((o) => !picked.list.includes(o));
+    const full = picked.list.map((o) => {
+      const r = normalizeRepo(inputs[`repo@${o}`]) || '';
+      return r.includes('/') ? r : `${o}/${r}`;
+    });
+    const options = [{
+      label: '就这些，继续',
+      value: `${picked.list.join(',')},${ORGS_DONE}`,
+      hint: `将添加 ${picked.list.length} 个账号：${full.join('、')}`,
+    }];
+    for (const o of rest.slice(0, 20)) {
+      options.push({
+        label: `再添加 ${o}`,
+        value: `${picked.list.join(',')},${o}`,
+        hint: `接着选 ${o} 下的仓库`,
+      });
+    }
+    return {
+      type: 'select',
+      key: 'orgs',
+      message: rest.length
+        ? '还要添加其他组织吗？（额度按组织算，每个组织是独立账号）'
+        : '组织都配好了，确认一下：',
+      options,
+    };
+  }
+
+  // 5) PROXY_KEY（多个账号共用同一个，它属于网关不属于账号）
   if (!inputs.proxyKey) {
     return {
       type: 'password',
@@ -1441,12 +1543,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           async authorize(inputs) {
             const token = (inputs?.token || '').trim();
             const proxyKey = (inputs?.proxyKey || '').trim();
-            // ask() 里选了组织/仓库就存下来；用户没选（自动跳过）就留给自动识别
-            const org = (inputs?.org || '').trim();
-            // 只填了仓库名（没带组织）时用上面选的组织补全，
-            // 否则 metadata.repo 只有半截，地址和账号都会对不上
-            const rawRepo = normalizeRepo(inputs?.repo) || '';
-            const repo = rawRepo && !rawRepo.includes('/') && org ? `${org}/${rawRepo}` : rawRepo;
+            // 这次要添加的全部 (组织, 仓库)。可能只有一个，也可能连着加了几个。
+            const targets = targetsOf(inputs);
             if (!token) return { type: 'failed', error: '请填写 CNB 访问令牌' };
             if (!proxyKey) return { type: 'failed', error: '请填写 PROXY_KEY' };
 
@@ -1510,7 +1608,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             // 这里不猜、也不补：地址、账号身份、巡检对象全挂在仓库上，
             // 自动选错会静悄悄接到另一个仓库的工作区去。拿不到就直接失败，
             // 让用户重登一次，而不是替他决定。
-            if (!repo) {
+            if (!targets.length) {
               return {
                 type: 'failed',
                 error: '没有选择仓库。地址和账号都按仓库算，请重新登录，'
@@ -1526,20 +1624,41 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               notes.push(`名下有 ${repos.length} 个仓库：${repos.slice(0, 8).join('、')}`
                 + `${repos.length > 8 ? ' 等' : ''}（插件会自动识别哪个跑着 cnb2api）`);
             }
+            if (targets.length > 1) {
+              notes.push(`本次添加 ${targets.length} 个账号：${targets.map((t) => t.repo).join('、')}`);
+            }
             say(`登录成功：\n  ${notes.join('\n  ')}`);
 
-            // 账号身份 = (CNB 用户, 组织, 仓库)。三段都写进去，且**不含
-            // PROXY_KEY**：多个账号通常填的是同一个 sk-xxx，只要掺进 key，
-            // 不管组织/仓库怎么选都会被判成同一个账号（magpie 靠身份相同
-            // 来决定「替换已有账号」还是「新增一个」）。
-            //
-            // 缺组织/仓库时用 `-` 占位，不能留空 —— 留空会退化成
-            // `ikoude+@cnb.cool` 这种，几个人、几个组织全都撞在一起。
-            // repo 本身已经带组织（org/repo），别再拼一次
-            const scope = repo
-              ? (repo.includes('/') ? repo : `${org || '-'}/${repo}`)
-              : `${org || '-'}/-`;
-            const accountId = `cnb:${uid}:${scope}`;
+            // 账号身份 = (CNB 用户, 组织/仓库)，且**不含 PROXY_KEY**：
+            // 多个账号通常填的是同一个 sk-xxx，只要掺进 key，不管组织/仓库
+            // 怎么选都会被判成同一个账号（magpie 靠身份相同来决定「替换已有
+            // 账号」还是「新增一个」）。repo 本身已经带组织，别再拼一次。
+            const metaOf = (t) => ({
+              token,
+              proxyKey,
+              uid,
+              username: username || undefined,
+              email: `${username || uid}+${t.repo}@cnb.cool`,
+              org: t.org || undefined,
+              repo: t.repo || undefined,
+            });
+
+            const all = targets.map(metaOf);
+            const mine = all[0];
+
+            // 宿主的登录流程一次只落一个账号（save 写一条），所以第二个
+            // 组织起由插件自己写进账号表 —— 否则用户有几个组织就得重登几次、
+            // 把令牌反复粘几遍。
+            if (all.length > 1) {
+              const { unsupported, failed } = await adoptAccounts(all.slice(1));
+              if (unsupported) {
+                warn('这个版本的 magpie 不接受一次写入多个账号，其余组织需要各登录一次'
+                  + `（${targets.slice(1).map((t) => t.repo).join('、')}）。`);
+              } else if (failed.length) {
+                warn(`有 ${failed.length} 个账号没能自动写入：${failed.join('、')}。`
+                  + '请对它们各登录一次。');
+              }
+            }
 
             return {
               type: 'success',
@@ -1547,20 +1666,10 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               key: proxyKey,
               // api 类型只保留 type/key/metadata，顶层字段多会被丢弃；
               // 真正决定身份的是 metadata.email，所以它必须唯一。
-              accountId,
-              uid: accountId,
-              name: `${username || uid}@${scope}`,
-              metadata: {
-                token,
-                proxyKey,
-                uid,
-                username: username || undefined,
-                // 身份标识，粒度到「组织/仓库」：额度按组织、地址按仓库。
-                email: `${username || uid}+${scope}@cnb.cool`,
-                // 下拉里选定的组织/仓库
-                org: org || undefined,
-                repo: repo || undefined,
-              },
+              accountId: `cnb:${uid}:${mine.repo}`,
+              uid: `cnb:${uid}:${mine.repo}`,
+              name: `${username || uid}@${mine.repo}`,
+              metadata: mine,
             };
           },
         },

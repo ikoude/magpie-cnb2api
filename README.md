@@ -65,17 +65,23 @@ magpie plugin login cnb2api
 ① CNB 访问令牌（CNB → 头像 → 访问令牌）        ← 手填
 ② 选择组织（共 3 个）
      acme │ bob │ alice                       ← 下拉
-③ 选择仓库（acme 下有 2 个在跑 cnb2api）
+③ 确认仓库（acme 下有 2 个在跑 cnb2api）
      acme/my-gateway (运行中) │ acme/other-api (已停止)
-④ PROXY_KEY（.cnb.yml 里设的那个）              ← 手填
+④ 还要添加其他组织吗？
+     就这些，继续 │ 再添加 bob │ 再添加 alice
+⑤ PROXY_KEY（.cnb.yml 里设的那个）              ← 手填
 ```
 
-省事的处理：
+④ 选了「再添加 bob」就回到 ③ 给 bob 选仓库，然后再问一次 ④，
+直到点「就这些，继续」。令牌和 PROXY_KEY 各填一次就够。
 
-- 只有 **1 个组织** → 自动跳过，不问
+几条不省的规矩：
+
 - **仓库一定让你选**，哪怕只有一个候选也列出来确认 —— 自动挑错了，
   地址和账号会挂到别的仓库上，而且很难发现
 - 一个仓库都没查到 → 要求手填仓库名，组织用上面选的；留空会直接报错
+- 只有 **1 个组织** 时（令牌只属于一个组织），选完就直接进仓库那步，
+  不会再问「还要加吗」
 
 ---
 
@@ -207,14 +213,34 @@ alice@acme/gateway-b    → 额度 1166（共享），地址 ab12****-9001.cnb.r
 
 额度是同一个（都属 acme），但地址和巡检完全独立——这样才能分别拉起。
 
+③ 和 ④ 都不用重登：一次登录里可以连着加，每选完一个组织会问
+「还要添加其他组织吗」，点「再添加 xxx」就继续，加完点「就这些，继续」。
+令牌只粘一次。
+
 ### 怎么登录
 
-每个"账号 × 组织/仓库"组合各登一次：
+**令牌只需要填一次。** 同一个令牌下的多个组织可以在一次登录里连着加：
 
 ```bash
-magpie plugin login cnb2api     # alice 的令牌 → 选 acme   → 选 acme/gateway
-magpie plugin login cnb2api     # alice 的令牌 → 选 gamma  → 选 gamma/gateway
-magpie plugin login cnb2api     # bob 的令牌   → 选 acme   → 选 acme/gateway
+magpie plugin login cnb2api
+#   令牌          粘贴一次
+#   选择组织      点 ikoude
+#   确认仓库      ikoude/cnb2api
+#   还要添加其他组织吗？ → 再添加 ukelaode
+#   确认仓库      ukelaode/cnb2api
+#   还要添加其他组织吗？ → 再添加 qdirs
+#   确认仓库      qdirs/cnb2api
+#   还要添加其他组织吗？ → 就这些，继续
+#   PROXY_KEY     粘贴一次（几个账号共用同一个）
+```
+
+一次登录就把三个组织全加好了。中间每一步都能选「就这些，继续」提前收工，
+所以只想要其中两个的话，加完第二个就停。
+
+换账号（另一个人的令牌）才需要重新跑一次 `login`：
+
+```bash
+magpie plugin login cnb2api     # bob 的令牌 → 选 acme → 选 acme/gateway
 ```
 
 组织和仓库都是下拉选择，选项来自令牌实际可访问的列表，不会让你填错。
@@ -224,7 +250,7 @@ magpie plugin login cnb2api     # bob 的令牌   → 选 acme   → 选 acme/ga
 > 「运行中 / 已停止」）。一个都没查到时手填报仓库名（组织用上面选的）。
 > 没选仓库登录会直接失败，不会替你猜。
 >
-> 选定的组织/仓库会写进账号身份，所以**同一份令牌登几次就是几个账号**。
+> 选定的组织/仓库会写进账号身份，所以**同一份令牌加几个组织就是几个账号**。
 > 想换某个账号的组织或仓库，重新登录一次即可，同组合会替换原来那条。
 
 ---
