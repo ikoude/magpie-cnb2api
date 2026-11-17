@@ -517,13 +517,31 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return null;
   }
 
+  // 同一仓库可能有多个工作区实例（每次启动/关闭都留一条）。
+  // 实测一个仓库能攒到 9 条（1 running + 8 closed）。挑选顺序：
+  //   1. 正在运行的 —— 直接能用，不用等冷启动
+  //   2. 最新的 —— 全关了的话重启它最快，环境也最接近上次
+  // 不能随便取 list[0]：那可能是很久以前的老实例，重建慢且可能缺改动。
   async function pickWorkspace() {
     const list = await listWorkspaces();
     if (!list.length) return null;
     const running = list.filter((w) => w.status === 'running');
-    const pick = running[0] || list[0];
-    return pick || null;
+    if (running.length) {
+      // 多个都在跑时取最新的，避免拿到一个即将被回收的
+      return running.sort((a, b) => tsOf(b) - tsOf(a))[0];
+    }
+    return list.sort((a, b) => tsOf(b) - tsOf(a))[0];
   }
+
+  // 工作区的时间字段是 create_time（不是 created_at），
+  // 兼容几种可能的写法，取不到就退回 0（保持原序）。
+  const tsOf = (w) => {
+    for (const k of ['create_time', 'createTime', 'created_at', 'updated_at']) {
+      const t = Date.parse(w?.[k] || '');
+      if (Number.isFinite(t)) return t;
+    }
+    return 0;
+  };
 
   // 确认仓库是否存在。用于把"仓库名填错"和"仓库在但没工作区"区分开，
   // 避免填错时一直尝试 start（会得到一串 404 且反复重试）。
