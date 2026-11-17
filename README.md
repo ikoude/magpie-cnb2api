@@ -124,14 +124,14 @@ magpie plugin login cnb2api
 组织和仓库都是**下拉选择**，选项来自令牌实际可访问的列表：
 
 ```
-① CNB 访问令牌（CNB → 头像 → 访问令牌）         ← 手填
-② 选择组织（共 N 个，每个组织是一个独立账号）
-     acme │ beta │ gamma                        ← 下拉
-③ 确认仓库（acme 下有 2 个在跑 cnb2api）
-     acme/gateway (运行中) │ acme/worker (已停止) │ 手动填写仓库名…
-④ PROXY_KEY（这个仓库 .cnb.yml 里 env 的值）      ← 手填，不可能自动拿到
-⑤ 还要添加其他组织吗？
-     就这些，完成登录（只加这 1 个） │ 再添加 beta │ 再添加 gamma
+① CNB 访问令牌 · 在 CNB 头像 → 访问令牌 里生成          ← 手填
+② 选择组织 · 该令牌可访问 N 个组织，每个组织对应一个独立账号
+     acme │ beta │ gamma                                ← 下拉
+③ 选择仓库 · acme 下有 2 个在跑 cnb2api
+     acme/gateway（运行中）│ acme/worker（已停止）│ 手动填写仓库名…
+④ PROXY_KEY · 这个仓库 .cnb.yml 里 env 的值              ← 手填，不可能自动拿到
+⑤ 还要添加其他组织吗
+     完成登录 · 只加这 1 个 │ 再加一个组织：beta │ 再加一个组织：gamma
 ```
 
 **顺序是 组织 → 仓库 → 这个仓库的密钥 → 还要加吗。** PROXY_KEY 跟着仓库
@@ -140,15 +140,16 @@ magpie plugin login cnb2api
 从 ⑤ 再加一个组织时，第二个仓库起不必重新粘贴：
 
 ```
-acme 的 PROXY_KEY（每个仓库各有一份）
-  和上一个仓库相同 │ 填一个不同的
+beta/gateway 的 PROXY_KEY · 每个仓库各有一份
+  和上一个仓库相同  — 沿用 acme/gateway 的值
+  填一个不同的      — 这个仓库 .cnb.yml 里是另一个值
 ```
 
 选「相同」沿用上一个仓库的值（同一份 `.cnb.yml` 复制到几个仓库很常见），
 选「不同」才弹输入框。**不会把一个仓库的 key 套到另一个仓库上。**
 
 **只加一个也完全 OK。** ③ 选完仓库、④ 填完密钥，⑤ 点
-「就这些，完成登录（只加这 1 个）」就结束。剩下的组织想加的时候再跑一次
+「完成登录 · 只加这 1 个」就结束。剩下的组织想加的时候再跑一次
 `magpie plugin login cnb2api` —— 那次要重新贴令牌和 PROXY_KEY，这是唯一的代价，
 账号本身没有区别。
 
@@ -230,7 +231,7 @@ magpie plugin options magpie-cnb2api '{
 | 同一个组织下两个仓库 | **可以不一样** |
 
 所以多仓库登录时按仓库分别问、分别存。填缺了哪个仓库，`authorize` 会点名
-报错（`这些仓库还没填 PROXY_KEY：acme/worker`），不会存一条 key 为空的账号。
+报错（`还没填这些仓库的 PROXY_KEY · acme/worker`），不会存一条 key 为空的账号。
 
 ---
 
@@ -422,8 +423,8 @@ magpie quota             # 看当前额度
 日志里的账号前缀让你分清是谁：
 
 ```
-[alice | acme/gateway]  已就绪：https://1a2b****-9001.cnb.run
-[alice | gamma/gateway] 已就绪：https://3c4d****-9001.cnb.run
+[alice | acme/gateway]  已就绪 · 1a2b****-9001.cnb.run
+[alice | gamma/gateway] 已就绪 · 3c4d****-9001.cnb.run
 ```
 
 常见现象：
