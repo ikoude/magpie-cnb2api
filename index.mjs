@@ -38,9 +38,6 @@ const DEFAULTS = {
   checkSeconds: 120,
   autoStart: true,
   port: 9001,
-  // 省核时：工作区 running 就按时间计费（每 5 分钟冻结一次）。
-  // 空闲超过这个分钟数自动停掉。0 = 不自动停。
-  idleStopMinutes: 0,
 };
 
 // 把用户填的各种写法归一成 org/repo。容忍：
@@ -78,9 +75,6 @@ function opts(given) {
   o.checkSeconds = Math.max(30, Number(o.checkSeconds) || DEFAULTS.checkSeconds);
   o.port = Number(o.port) || 9001;
   o.autoStart = o.autoStart !== false && o.autoStart !== 'false';
-  // 0 或负数 = 不自动停；否则最小 5 分钟（比一个计费周期短就没意义）
-  const idle = Number(o.idleStopMinutes) || 0;
-  o.idleStopMinutes = idle > 0 ? Math.max(5, Math.round(idle)) : 0;
   o.repo = normalizeRepo(o.repo);
   return o;
 }
@@ -170,15 +164,6 @@ const PERMISSIONS = [
     why: '按模型统计 token 与 credit，排查异常消耗时有用。',
     endpoint: 'GET /{repo}/-/build/logs/ai-request/...',
     missing: '无影响',
-  },
-  {
-    scope: 'account-engage:rw',
-    need: 'optional',
-    label: '停止工作区（省核时）',
-    why: '工作区 running 就按时间扣核时（每 5 分钟冻结一次），'
-      + '不发请求也在扣。有了这项才能主动停掉，用完就停最省。',
-    endpoint: 'POST /workspace/stop',
-    missing: '不能主动省核时（stop 工具和 idleStopMinutes 都用不了），只能等平台回收',
   },
   {
     scope: 'repo-code:r',
@@ -273,17 +258,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       readyPromise: null,
       discovering: null,
       reported: false,
-      // ---- 省核时相关 ----
-      // 最后一次"真的用了它"的时间（有请求进来 / 手动拉起）
-      lastUsedAt: 0,
-      // 拿到可用地址的时刻，空闲计时从这里起算
-      readySince: 0,
-      // 手动停掉之后置 true：这时 autoStart 不再自动拉起，
-      // 否则用户刚停、巡检又拉起来，白花钱
-      paused: false,
-      stoppedReason: null,
-      stopping: false,
-      stopBlocked: false,
     };
   }
 
@@ -575,10 +549,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         body: JSON.stringify({ branch: cfg.branch }),
         timeout: 60000,
       });
-      // 拉起即视为"开始使用"，把空闲计时归零
-      state.lastUsedAt = Date.now();
-      state.paused = false;
-      state.stoppedReason = null;
       say('启动已提交，等待地址出现');
     } catch (e) {
       if (e?.permission) {
@@ -591,77 +561,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     } finally {
       state.starting = false;
     }
-  }
-
-  // 停掉工作区。这是唯一能真正止住核时的动作：
-  // 工作区一旦 running 就按时间扣费（每 5 分钟冻结一次），不发请求也照常扣。
-  // 需要 account-engage:rw 权限。
-  async function stopWorkspace(reason = 'manual') {
-    if (state.stopping) return { ok: false, message: '正在停止，请稍候' };
-    if (!state.sn) return { ok: false, message: '还没拿到工作区编号（sn），无法停止' };
-    state.stopping = true;
-    try {
-      // 接口要的是 sn（构建号），不是 slug
-      await api('/workspace/stop', {
-        method: 'POST',
-        body: JSON.stringify({ sn: state.sn }),
-        timeout: 60000,
-      });
-      state.paused = true;
-      state.stoppedReason = reason;
-      state.uri = null;
-      state.status = 'stopped';
-      const why = reason === 'idle'
-        ? `空闲超过 ${cfg.idleStopMinutes} 分钟`
-        : '手动停止';
-      say(`工作区已停止（${why}），不再消耗核时。下次请求会自动拉起。`);
-      return { ok: true, message: `已停止（${why}）` };
-    } catch (e) {
-      if (e?.permission) {
-        state.stopBlocked = true;
-        const msg = '停止工作区需要 account-engage:rw 权限。'
-          + '到 CNB → 头像 → 访问令牌 → 编辑，勾上后重试。';
-        warn(msg);
-        return { ok: false, message: msg };
-      }
-      warn(`停止失败：${e.message}`);
-      return { ok: false, message: e.message };
-    } finally {
-      state.stopping = false;
-    }
-  }
-
-  // 空闲检查：在定时巡检里跑。
-  // 只在"确实开着 + 确实没人用"时才停，避免刚拉起就被停掉。
-  async function checkIdle() {
-    if (!cfg.idleStopMinutes) return;
-    if (state.status !== 'running') return;
-    if (state.starting || state.recovering) return;
-    if (state.paused) return;                      // 已经停过了
-
-    // 从"拿到地址那一刻"起算空闲。
-    // 不能用 lastUsedAt 的 0 当"没记录过就不动" —— 那样只巡检查额度、
-    // 一直没发过请求的场景永远不会停下，而它正是在白烧核时。
-    const since = state.lastUsedAt || state.readySince;
-    if (!since) return;
-
-    const idleMs = Date.now() - since;
-    // 阈值按分钟算。测试时可用环境变量改成秒，方便验证这条路径。
-    const limitMs = process.env.CNB2API_IDLE_TEST_SECS
-      ? Number(process.env.CNB2API_IDLE_TEST_SECS) * 1000
-      : cfg.idleStopMinutes * 60_000;
-    if (idleMs < limitMs) return;
-
-    // 停之前再确认一次确实没有新请求进来（并发场景下 lastUsedAt 可能刚被刷新）
-    if (state.lastUsedAt > since) return;
-
-    // 探活：不通说明已经挂了，交给正常流程处理，不在这里停
-    // （测试可用 CNB2API_SKIP_HEALTH=1 跳过，因为 mock 环境的 cnb.run 地址不可达）
-    if (state.uri && process.env.CNB2API_SKIP_HEALTH !== '1') {
-      const alive = await health(state.uri, 3000);
-      if (!alive) return;
-    }
-    await stopWorkspace('idle');
   }
 
   async function health(base, ms = 12000) {
@@ -797,19 +696,15 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           return state;
         }
         state.lastError = `仓库 ${cfg.repo} 从未启动过工作区`;
-        if (cfg.autoStart && !state.paused) await startWorkspace();
+        if (cfg.autoStart) await startWorkspace();
         return state;
       }
       state.sn = ws.sn;
       state.status = ws.status;
 
       if (ws.status !== 'running') {
-        state.lastError = state.paused
-          ? `工作区已停止（${state.stoppedReason === 'idle' ? '空闲自动停止' : '手动停止'}），有请求时会自动拉起`
-          : `工作区已停止（sn=${ws.sn}）`;
-        // paused 时不自动拉起 —— 用户刚为了省核时把工作区停了，
-        // 巡检再拉开就等于白停一次。等真的有请求进来再说。
-        if (cfg.autoStart && !state.paused) {
+        state.lastError = `工作区已停止（sn=${ws.sn}）`;
+        if (cfg.autoStart) {
           await startWorkspace();
           // 拉起后工作区要几十秒才真正就绪，同一次调用里先不等，
           // 但标记"正在等启动"，让 waitForReady 去轮询
@@ -818,13 +713,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         return state;
       }
 
-      // 开着的时候顺便看一眼是不是闲置太久，该停就停（省核时）
       const ok = await resolveUri(ws.sn);
       if (ok) state.recovering = false;
-
-      // 放在 resolveUri 之后：checkIdle 要用 readySince 算空闲，
-      // 而 readySince 是在 resolveUri 里拿到地址时才写的。
-      await checkIdle();
     } catch (e) {
       state.failures += 1;
       state.lastError = humanize(e);
@@ -850,9 +740,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       // 日志里也打码：日志常被贴出来求助，完整地址等于公开端点
       say(`${state.uri ? '地址已更新' : '已就绪'}：${maskHost(hostOf(uri))}`);
       state.uri = uri;
-      // 拿到新地址 = 工作区刚起来，从这一刻开始算空闲
-      state.readySince = Date.now();
-      state.paused = false;
     }
 
     if (!(await health(uri))) {
@@ -1441,16 +1328,20 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     };
   }
 
-  // 3) 仓库（必选）。地址按仓库算，同组织下可能有多个 cnb2api 仓库，
-  //    不指定就不知道该跟哪个的地址。
-  if (!inputs.repo && !inputs.repoAsked) {
+  // 3) 仓库（必选，而且必须由用户自己点）
+  //
+  // 不能自动挑：同一个组织下可能有好几个仓库都跑着 cnb2api，日志里的
+  // PROXY_URI 只能说明"这个仓库跑过"，说明不了用户想用哪个 —— 自动选中
+  // 错了，地址、账号、巡检就全挂到别的仓库上去了。所以哪怕只有一个候选，
+  // 也照样列出来让用户确认。
+  if (!inputs.repo) {
     const found = await listCnbReposForLogin(token, inputs.org).catch(() => null);
     if (!found) {
-      // 查不到就手填，但不能留空
+      // 查询失败：手填，但不能留空
       return {
         type: 'text',
         key: 'repo',
-        message: '仓库（自动查询失败，请手动填写，例如 my-gateway）',
+        message: '仓库（自动查询失败，请手动填写，例如 org/my-gateway）',
         placeholder: 'org/repo 或仓库名',
       };
     }
@@ -1463,14 +1354,12 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         placeholder: '例如 cnb2api（可只写仓库名，组织用上面选的）',
       };
     }
-    if (found.length === 1) {
-      // 只有一个，直接用它，不打扰用户
-      return askNext({ ...inputs, repo: found[0].repo, repoAsked: true });
-    }
     return {
       type: 'select',
       key: 'repo',
-      message: `选择仓库（${inputs.org} 下有 ${found.length} 个在跑 cnb2api）`,
+      message: found.length === 1
+        ? `确认仓库（${inputs.org} 下只有这 1 个跑着 cnb2api）`
+        : `选择仓库（${inputs.org} 下有 ${found.length} 个在跑 cnb2api）`,
       options: found.map((r) => ({
         label: r.repo,
         value: r.repo,
@@ -1557,7 +1446,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             // 只填了仓库名（没带组织）时用上面选的组织补全，
             // 否则 metadata.repo 只有半截，地址和账号都会对不上
             const rawRepo = normalizeRepo(inputs?.repo) || '';
-            let repo = rawRepo && !rawRepo.includes('/') && org ? `${org}/${rawRepo}` : rawRepo;
+            const repo = rawRepo && !rawRepo.includes('/') && org ? `${org}/${rawRepo}` : rawRepo;
             if (!token) return { type: 'failed', error: '请填写 CNB 访问令牌' };
             if (!proxyKey) return { type: 'failed', error: '请填写 PROXY_KEY' };
 
@@ -1616,19 +1505,18 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               };
             }
 
-            // ---- 2. 仓库可能没传到这里，补救一次 ----
+            // ---- 2. 仓库必须是用户自己选的 ----
             //
-            // ask() 在「组织下只查到 1 个候选仓库」时会直接跳过这一问，
-            // 把答案写在它自己的 inputs 里继续问下一个问题 —— 宿主只收集
-            // 它真正问过的那几栏，所以 repo 到不了这里。结果是 metadata
-            // 里没有 repo，账号身份退化成「用户+组织」，同组织的多个仓库
-            // 全被并成一个（也正是之前所有登录看起来都只登了一个的原因）。
-            if (!repo && org) {
-              const found = await listCnbReposForLogin(token, org).catch(() => null);
-              if (found && found.length === 1) {
-                repo = found[0].repo;
-                say(`组织 ${org} 下只有 ${repo} 跑着 cnb2api，按它登录`);
-              }
+            // 这里不猜、也不补：地址、账号身份、巡检对象全挂在仓库上，
+            // 自动选错会静悄悄接到另一个仓库的工作区去。拿不到就直接失败，
+            // 让用户重登一次，而不是替他决定。
+            if (!repo) {
+              return {
+                type: 'failed',
+                error: '没有选择仓库。地址和账号都按仓库算，请重新登录，'
+                  + '在「选择仓库」那一步选中要用的 cnb2api 仓库（只填仓库名也可以，'
+                  + '组织用上面选的那个）。',
+              };
             }
 
             // ---- 3. 顺手把这个账号名下的仓库列出来，方便用户确认 ----
@@ -1710,14 +1598,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           const fetchFor = (input, init, boundCtx) => within(boundCtx, () => doFetch(input, init));
 
           const doFetch = async (input, init = {}) => {
-            // 每来一个请求就记一次"在用"，空闲自动停止靠它判断
-            state.lastUsedAt = Date.now();
-            // 用户为了省核时把工作区停了，现在又来请求了 —— 该拉起来了
-            if (state.paused) {
-              state.paused = false;
-              state.stoppedReason = null;
-              say('收到请求，重新拉起工作区');
-            }
             // 地址没拿到就别发到一个假域名上，直接给出可读原因
             if (!state.uri) {
               await refresh('no-uri');
@@ -1919,33 +1799,23 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       },
     },
 
-    // ---- 工具：让 agent 自己管理核时 ----
+    // ---- 工具：查看 / 拉起工作区、查额度 ----
     // tool 会暴露到 magpie 的 plugin-tools MCP server 上，agent 可直接调用。
-    // 工作区 running 就按时间扣费，所以"用完就停"是唯一有效的省钱动作。
     //
     // 宿主的 runTool 不注入账号作用域，所以要自己遍历 ctxs 跑每个账号。
     tool: {
       cnb2api_workspace_status: {
-        description:
-          '查看 CNB2API 工作区当前状态：是否在运行、地址、空闲多久、是否已被暂停。'
-          + '在决定要不要停止（省核时）之前先调这个。',
+        description: '查看 CNB2API 工作区当前状态：是否在运行、仓库、地址、工作区编号。',
         args: {},
         async execute() {
           return forEachAccount(async (ctx) => {
             if (!state.sn) await refresh('tool-status').catch(() => {});
-            const idleMin = state.lastUsedAt
-              ? Math.floor((Date.now() - state.lastUsedAt) / 60_000)
-              : null;
             const lines = [
-              `状态：${state.status || 'unknown'}${state.paused ? '（已暂停，不再自动拉起）' : ''}`,
+              `状态：${state.status || 'unknown'}`,
               `仓库：${cfg.repo || '（未确定）'}`,
               `地址：${state.uri ? maskHost(hostOf(state.uri)) : '（无）'}`,
             ];
             if (state.sn) lines.push(`工作区编号：${state.sn}`);
-            if (idleMin != null) lines.push(`空闲：${idleMin} 分钟`);
-            lines.push(cfg.idleStopMinutes
-              ? `空闲自动停止：${cfg.idleStopMinutes} 分钟`
-              : '空闲自动停止：未开启（idleStopMinutes=0）');
             if (state.lastError) lines.push(`最近错误：${state.lastError}`);
             return lines;
           });
@@ -1954,7 +1824,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
 
       cnb2api_workspace_start: {
         description:
-          '拉起 CNB2API 工作区。工作区已停止时调用它。注意：运行中的工作区会持续消耗核时。',
+          '拉起 CNB2API 工作区。工作区已停止时调用它，拉起后约 30–90 秒才可用。',
         args: {},
         async execute() {
           return forEachAccount(async () => {
@@ -1966,22 +1836,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             return [ok
               ? `已拉起并可用：${maskHost(hostOf(state.uri))}`
               : `已提交拉起，但还没就绪（${state.lastError || '等待中'}），稍后再查或直接发请求`];
-          });
-        },
-      },
-
-      cnb2api_workspace_stop: {
-        description:
-          '停止 CNB2API 工作区以节省核时。工作区一旦 running 就按时间计费，'
-          + '即使没有请求也在扣。用完就可以停，下次请求会自动拉起。'
-          + '需要令牌含 account-engage:rw 权限。',
-        args: {},
-        async execute() {
-          return forEachAccount(async () => {
-            const r = await stopWorkspace('manual');
-            return [r.ok
-              ? `${r.message}。核时已停止累积，下次请求会自动拉起（冷启动约 30–90 秒）。`
-              : `没能停止：${r.message}`];
           });
         },
       },
