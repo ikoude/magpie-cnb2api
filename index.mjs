@@ -1489,10 +1489,37 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     };
   }
 
-  // 4) 还要加别的组织吗
+  // 4) PROXY_KEY
+  //
+  // 顺序：令牌 → 组织 → 仓库 → PROXY_KEY → 还要加别的组织吗。
+  //
+  // key 跟组织/仓库无关（它属于网关），账号的基本信息（组织 + 仓库）一确认
+  // 就该把它填掉；「还要加吗」放在最后是收尾确认 —— 这样填完密钥之后剩下
+  // 的只有"要不要继续扩展"，不会是"填完密码又冒出一个问题、不知道流程到底
+  // 完没完"。
+  //
+  // 这个**必须手填，没有任何"自动获取"的可能**：它只是你自己 .cnb.yml 里
+  // env 的一个值，CNB 的 OpenAPI 读不到工作区的 env（能读到就等于谁拿到
+  // 令牌都能读别人的密钥）。
+  //
+  // 一次登录加多个账号时也只问一次：PROXY_KEY 属于网关，不属于账号，
+  // 同一份 .cnb.yml 起的 cnb2api 用的是同一个 key，所有账号共用。
+  if (!inputs.proxyKey) {
+    return {
+      type: 'password',
+      key: 'proxyKey',
+      message: picked.list.length > 1
+        ? `PROXY_KEY（.cnb.yml 里的那个，通常 sk- 开头）—— 本次 ${picked.list.length} 个账号共用这一个`
+        : 'PROXY_KEY（你自己 .cnb.yml 里设的那个，通常 sk- 开头）—— 再加组织也是它，不会重复问',
+      placeholder: 'sk-…',
+    };
+  }
+
+  // 5) 还要加别的组织吗
   //
   // 已经配好仓库的组织在提示里列出来，让用户看得见「现在要加的是哪几个」。
-  // 答案仍然写回 orgs，末尾补上 __done__ 就表示收工。
+  // 答案仍然写回 orgs，末尾补上 __done__ 就表示收工 —— 这是最后一步，
+  // 答「就这些」登录立刻完成。
   if (!picked.done) {
     const all = (await listOrgsForLogin(token).catch(() => null)) || [];
     const rest = all.filter((o) => !picked.list.includes(o));
@@ -1502,7 +1529,9 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     });
     const options = [{
       // 只加一个组织、且想一次收工时这就是唯一的路 —— 标签说直白点
-      label: picked.list.length === 1 ? '就这些，继续（只加这 1 个）' : '就这些，继续',
+      label: picked.list.length === 1
+        ? '就这些，完成登录（只加这 1 个）'
+        : '就这些，完成登录',
       value: `${picked.list.join(',')},${ORGS_DONE}`,
       hint: `将添加 ${picked.list.length} 个账号：${full.join('、')}`,
     }];
@@ -1519,30 +1548,12 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       type: 'select',
       key: 'orgs',
       message: rest.length
-        ? '还要添加其他组织吗？（令牌只贴这一次；点「就这些」就只加上面这些）'
-        : '组织都配好了，确认一下：',
+        ? '还要添加其他组织吗？（点「就这些」就完成登录，令牌和 PROXY_KEY 都不会再问）'
+        : '组织都配好了，确认完成登录：',
       options,
     };
   }
 
-  // 5) PROXY_KEY
-  //
-  // 这个**必须手填，没有任何"自动获取"的可能**：它只是你自己 .cnb.yml 里
-  // env 的一个值，CNB 的 OpenAPI 读不到工作区的 env（能读到就等于谁拿到
-  // 令牌都能读别人的密钥）。所以登录流程的最后一步一定问它。
-  //
-  // 一次登录加多个账号时也只问一次：PROXY_KEY 属于网关，不属于账号，
-  // 同一份 .cnb.yml 起的 cnb2api 用的是同一个 key，所有账号共用。
-  if (!inputs.proxyKey) {
-    return {
-      type: 'password',
-      key: 'proxyKey',
-      message: picked.list.length > 1
-        ? `PROXY_KEY（.cnb.yml 里的那个，通常 sk- 开头）—— ${picked.list.length} 个账号共用这一个，只问一次`
-        : 'PROXY_KEY（你自己 .cnb.yml 里设的那个，通常 sk- 开头）',
-      placeholder: 'sk-…',
-    };
-  }
   return null;
 
   }
@@ -1589,7 +1600,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           label: 'CNB2API 凭据',
           // prompts 是给不支持动态提问的宿主用的静态兜底（OpenCode 只认这个）。
           // magpie 走下面的 ask()，能按已答内容动态生成下拉选项。
-          // 不支持动态提问的宿主（OpenCode 只认 prompts）用这组静态兜底。
+          // 顺序和 ask() 一致：令牌 → 组织 → 仓库 → PROXY_KEY。
           // 组织/仓库必须问：额度按组织算、地址按仓库算，缺了就分不开。
           prompts: [
             { type: 'password', key: 'token', message: 'CNB 访问令牌（CNB → 头像 → 访问令牌）' },
@@ -1726,7 +1737,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             //
             // 注意：这是**可选**的省事路径。用户完全可以每次只加一个组织，
             // 分几次登录（各自贴一次令牌），结果完全一样 —— 见 askNext 里
-            // 「就这些，继续」那条分支。
+            // 「就这些，完成登录」那条分支。
             if (all.length > 1) {
               const { unsupported, failed } = await adoptAccounts(all.slice(1));
               if (unsupported) {
