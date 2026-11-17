@@ -273,7 +273,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       readyPromise: null,
       discovering: null,
       reported: false,
-      warnedLegacyAccount: false,
       // ---- 省核时相关 ----
       // 最后一次"真的用了它"的时间（有请求进来 / 手动拉起）
       lastUsedAt: 0,
@@ -321,55 +320,38 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   //
   // 组织可能还没确定（repo 留空 → 自动发现），这时先按 token 归组，
   // 等 applyCredentials 拿到 org 后再迁移到带 org 的键上。
-  // 账号在界面/日志/工具输出里的名字。
-  // 粒度取到「组织/仓库」：同组织下两个仓库是两个账号，
-  // 只写用户名或只写组织都分不出来。
-  //
-  // runtimeRepo 传运行时识别出的仓库（旧账号没存，靠它补）。
-  function labelOf(auth, ctx, runtimeRepo) {
+  // 账号在界面/日志/工具输出里的名字：<用户>@<组织/仓库>。
+  // 粒度取到仓库 —— 同组织下两个仓库是两个账号，只写用户名或组织都分不出来。
+  function labelOf(auth, ctx) {
     const meta = auth?.metadata || {};
     const name = String(
       meta.username || meta.email || auth?.label || ctx?.key || '',
     ).trim();
-    const repo = String(meta.repo || runtimeRepo || '').trim();
+    const repo = String(meta.repo || '').trim();
     const label = repo && name ? `${name}@${repo}` : (name || ctx?.key || '');
     return label.slice(0, 48);
   }
 
-  // 组织：额度按它算。优先 metadata.org，其次仓库前缀。
-  function orgOf(auth) {
-    const meta = auth?.metadata || {};
-    const fromRepo = String(meta.repo || '').includes('/')
-      ? String(meta.repo).split('/')[0]
-      : '';
-    return String(meta.org || fromRepo || '').trim();
-  }
-
-  // 仓库：地址按它算。只有用户明确选了仓库才有值。
+  // 仓库：登录时必选，地址和账号区分都按它算。
   function repoOf(auth) {
     const meta = auth?.metadata || {};
     const r = normalizeRepo(meta.repo || '');
     return r.includes('/') ? r : '';
   }
 
-  // ctx 的键。
+  // ctx 的键 = (token 指纹, 组织/仓库)。
   //
-  // 三个维度的粒度并不相同：
-  //   区分账号 / 工作区地址  → 用户 | 组织/仓库
-  //   额度                   → 用户 | 组织
+  // 三类信息的粒度不同：
+  //   账号区分 / 工作区地址 → 用户 | 组织/仓库
+  //   额度                  → 用户 | 组织
   //
-  // 所以键取到「组织/仓库」这一层：同组织下跑两个 cnb2api 仓库时，
-  // 地址和巡检必须各管各的；而额度天然只跟组织走，多个仓库落在同一组织
-  // 会显示同一份额度 —— 这是正确的，因为计费主体就是组织。
-  //
-  // 仓库没选时退回组织粒度，等 applyCredentials 拿到 repo 后再迁移。
+  // 所以键取到仓库这一层：同组织下跑两个 cnb2api 仓库时，
+  // 地址和巡检各管各的；额度天然只跟组织走，两个仓库显示同一份
+  // —— 这是正确的，计费主体就是组织。
   function keyOf(auth) {
     const meta = auth?.metadata || {};
     const token = String(meta.token || auth?.key || auth?.access || '').trim();
-    const repo = repoOf(auth);
-    if (repo) return `${fp(token)}@${repo}`;
-    const org = orgOf(auth);
-    return org ? `${fp(token)}@${org}` : fp(token);
+    return `${fp(token)}@${repoOf(auth)}`;
   }
 
   function ctxFor(auth) {
@@ -408,11 +390,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         }
         return fn(ctx);
       }).catch((e) => [`执行失败：${e.message}`]);
-      // refresh 之后 cfg.repo 才可能识别出来，这时才补得上仓库后缀
-      if (!String(ctx.label || '').includes('@')) {
-        const repo = ctx.cfg?.repo || '';
-        if (repo && ctx.label) ctx.label = `${ctx.label}@${repo}`.slice(0, 48);
-      }
       const head = multi ? `【${ctx.label || ctx.key}】` : '';
       const body = Array.isArray(lines) ? lines : [String(lines)];
       return head ? [head, ...body.map((l) => `  ${l}`)].join('\n') : body.join('\n');
@@ -509,53 +486,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     // 宁可多这一步，也不能误用别的仓库的工作区（会去读错日志、甚至拉起错仓库）
     if (!cfg.repo) return list;
     return list.filter((w) => (w.slug || w.repo_url) === cfg.repo);
-  }
-
-  // ---------- 自动发现仓库 ----------
-  // repo 留空时，用 token 拉「我的所有工作区」，找出哪个仓库跑着 cnb2api：
-  // 优先看 running 的，再看日志里有没有 PROXY_URI=。
-  async function discoverRepo() {
-    let list;
-    try {
-      list = await listWorkspaces();   // 不带 slug
-    } catch (e) {
-      if (e?.permission || /HTTP 401/.test(e?.message || '')) throw e;
-      return null;
-    }
-    if (!list.length) return null;
-
-    // 去重出仓库列表，running 的排前面
-    const byRepo = new Map();
-    for (const w of list) {
-      const slug = w.slug || w.repo_url;
-      if (!slug) continue;
-      const cur = byRepo.get(slug);
-      const running = w.status === 'running';
-      if (!cur || (running && !cur.running)) byRepo.set(slug, { slug, sn: w.sn, running });
-    }
-    const candidates = [...byRepo.values()].sort((a, b) => Number(b.running) - Number(a.running));
-
-    // 名字里带 cnb2api 的直接优先（最常见情况），省一轮日志
-    candidates.sort((a, b) => Number(/-?cnb2api\b/i.test(b.slug)) - Number(/-?cnb2api\b/i.test(a.slug)));
-
-    for (const c of candidates) {
-      // 名字命中就先用它，不再逐条扒日志
-      if (/-?cnb2api\b/i.test(c.slug)) {
-        return c.slug;
-      }
-      try {
-        const res = await api(
-          `/${c.slug}/-/build/runner/download/log/${encodeURIComponent(c.sn)}-001`,
-          { timeout: 20000 },
-        );
-        const logText = await res.text();
-        const picked = pickUriFromLog(logText, cfg.port);
-        if (picked) {
-          return c.slug;
-        }
-      } catch { /* 没有权限或日志里没地址，换下一个 */ }
-    }
-    return null;
   }
 
   // 工作区的时间字段是 create_time（不是 created_at），
@@ -743,22 +673,16 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     }
   }
 
-  // 一次完整检查：列表 -> 停止则拉起 -> 取地址 -> 验活
-  // 自动发现仓库，带互斥：自检和 refresh 可能同时想发现，只让一个跑
+  // 补齐仓库：登录时必选，但可能只写了仓库名（如 "gateway"），
+  // 这时用 token 所属身份补出 org/repo。
+  // 带互斥：自检和 refresh 可能同时想补，只让一个跑。
   function discoverOnce() {
     if (state.discovering) return state.discovering;
     state.discovering = (async () => {
       await expandBareRepo();
-      const found = cfg.repo ? null : await discoverRepo();
-      if (found && !cfg.repo) {
-        cfg.repo = found;
-        say(`未配置 repo，已自动识别为 ${found}`);
-      }
       return cfg.repo || null;
     })().finally(() => {
-      // 失败时不要留下已 resolve 的 Promise：否则后面每次调用都拿到
-      // 那个旧的 null，再也不会重试 —— 工作区晚一点起来就永远认不出来。
-      // 成功（cfg.repo 已定）时留着无所谓，反正下次会直接返回它。
+      // 失败时不要留下已 resolve 的 Promise，否则后续调用都拿到那个旧值
       if (!cfg.repo) state.discovering = null;
     });
     return state.discovering;
@@ -1413,16 +1337,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       if (!cfg.proxyKey) cfg.proxyKey = proxyKey;
     }
 
-    // 旧版本登录的账号没有 metadata.email，多账号无法区分。
-    // 插件改不了宿主存储，只能提示用户重登一次。
-    if (meta.token && !meta.email && !state.warnedLegacyAccount) {
-      state.warnedLegacyAccount = true;
-      warn('这个账号是旧版本登录的（缺 metadata.email），会导致多账号被合并。'
-        + `请重新执行一次 magpie plugin login ${PLUGIN_ID} 以启用多账号区分。`);
-    }
-
-    // repo：下拉里选过就用它（明确意图，别再去猜）；
-    // 没选就让 refresh 里的 discoverRepo() 自动识别。
+    // repo：登录时选定的仓库（必填）
     if (!cfg.repo && meta.repo) {
       const picked = normalizeRepo(meta.repo);
       if (picked) {
@@ -1430,12 +1345,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       }
     }
 
-    // 组织此刻已确定（metadata.org 或仓库前缀），补上名字里的组织后缀。
-    // 旧账号标签只有用户名，不补的话多组织会显示成同一个人。
-    const c = cur();
-    if (c && !String(c.label || '').includes('@')) {
-      c.label = labelOf(auth, c, cfg.repo);
-    }
   }
 
   // ---------- 后台轮询 ----------
@@ -1723,14 +1632,11 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
                 proxyKey,
                 uid,
                 username: username || undefined,
-                // 账号身份标识，粒度取到「组织/仓库」：
-                //   额度按组织算，地址按仓库算，
-                //   所以同组织下的两个仓库必须是两个独立账号（地址各管各的）。
-                // 仓库没选时退回组织粒度，避免已登录的旧账号被当成新的。
-                email: username
-                  ? `${username}+${repo && repo.includes('/') ? repo : org || '-'}@cnb.cool`
-                  : undefined,
-                // 下拉里选定的组织/仓库。没选（自动跳过）时不写，交给自动识别。
+                // 账号身份标识，粒度取到组织/仓库：
+                // 额度按组织算、地址按仓库算，所以同组织下两个仓库
+                // 必须是两个独立账号，否则地址会互相覆盖。
+                email: `${username}+${repo}@cnb.cool`,
+                // 下拉里选定的组织/仓库
                 org: org || undefined,
                 repo: repo || undefined,
               },
@@ -1748,10 +1654,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         if (!ctx.label) ctx.label = labelOf(auth, ctx);
         return within(ctx, async () => {
           applyCredentials(auth);   // 先读凭据，再启动轮询（顺序很关键）
-          // cfg.repo 可能已经识别出来了，用它补齐组织后缀
-          if (!ctx.label.includes('@')) {
-            ctx.label = labelOf(auth, ctx, cfg.repo);
-          }
           ensureTimer();
 
           // 首次调用时把权限状况说清楚（只跑一次）
@@ -1877,9 +1779,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         // 必须先把凭据读进 cfg —— usage 可能先于 loader 被调用（比如刚登录、
         // 或只在界面上看额度而不发消息），缺少这步 cfg.token 就是空的。
         applyCredentials(auth);
-        if (!ctx.label.includes('@')) {
-          ctx.label = labelOf(auth, ctx, cfg.repo);
-        }
 
         // 账号在界面上的名字。粒度到「组织/仓库」：同组织下两个仓库
         // 是两个账号，只写用户名或只写组织都分不开。
@@ -1887,8 +1786,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         const userName = String(
           auth?.metadata?.username || auth?.metadata?.email || auth?.name || '',
         ).trim();
-        // 旧账号没有 metadata.repo，用运行时识别出的仓库补
-        const authRepo = String(auth?.metadata?.repo || cfg.repo || '').trim();
+        const authRepo = String(auth?.metadata?.repo || '').trim();
         const accountName = userName
           ? (authRepo ? `${userName}@${authRepo}` : userName)
           : '';
