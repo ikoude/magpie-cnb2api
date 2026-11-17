@@ -1296,6 +1296,12 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   // 永远留一个自己填的口子，不能把用户卡在候选列表里。
   const REPO_MANUAL = '__manual__';
 
+  // 多仓库登录时，第 2 个仓库起对 PROXY_KEY 的选择：
+  //   和上一个仓库相同 / 填一个不同的。key 是每个仓库各一份的，
+  //   但同一个人常把同一份 .cnb.yml 复制到多个仓库，值得给个一键沿用。
+  const KEY_SAME = '__same__';
+  const KEY_OTHER = '__other__';
+
   // 把 inputs.orgs 拆成 { list, done }。
   // 答案是一串逗号分隔的组织，末尾可能带 __done__ —— 用单个字面量
   // 承载整个状态，是因为宿主只会把「真正弹出来过的问题」的答案交回来，
@@ -1326,6 +1332,34 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       }
     }
     return out;
+  }
+
+  // 每个仓库自己的 PROXY_KEY。
+  //
+  // **PROXY_KEY 属于那个仓库的工作区**（写在该仓库 `.cnb.yml` 的 env 里），
+  // 不是"整个网关一把钥匙"：同一个人的两个仓库完全可以一个 sk-a、一个 sk-b。
+  // 同一份 .cnb.yml 起的 cnb2api，不同账号用的才是同一个值。
+  // 所以 key 必须按仓库存：inputs['proxyKey@' + repo]，单仓库时仍用 inputs.proxyKey
+  // （静态 prompts 那条路和"只加一个"都走它）。
+  //
+  // KEY_SAME 是"和上一个仓库相同"的选项值，解析时替换成上一个仓库的 key，
+  // 这样连续加几个用同一个 key 的仓库时不用反复粘贴。
+  function keyMapOf(inputs, targets) {
+    const map = new Map();
+    const base = String(inputs?.proxyKey || '').trim();
+    let last = base || '';
+    targets.forEach((t, i) => {
+      const own = String(inputs?.[`proxyKey@${t.repo}`] ?? '').trim();
+      let v = '';
+      if (own === KEY_SAME) v = last;
+      else if (own && own !== KEY_OTHER) v = own;
+      else if (i === 0 && base) v = base;   // 第一个仓库的 key 落在 inputs.proxyKey
+      if (v) {
+        map.set(t.repo, v);
+        last = v;
+      }
+    });
+    return map;
   }
 
   // 一次登录里除第一个以外的账号，由插件直接写进 magpie 的账号表。
@@ -1493,26 +1527,60 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   //
   // 顺序：令牌 → 组织 → 仓库 → PROXY_KEY → 还要加别的组织吗。
   //
-  // key 跟组织/仓库无关（它属于网关），账号的基本信息（组织 + 仓库）一确认
-  // 就该把它填掉；「还要加吗」放在最后是收尾确认 —— 这样填完密钥之后剩下
-  // 的只有"要不要继续扩展"，不会是"填完密码又冒出一个问题、不知道流程到底
-  // 完没完"。
+  // PROXY_KEY 跟着**仓库**走：它写在该仓库 `.cnb.yml` 的 env 里，属于那个
+  // 仓库的工作区。所以仓库一定就位之后再问它，而且是**一个仓库问一次** ——
+  // 两个仓库完全可能一个 sk-a 一个 sk-b，不能填一次套给所有账号。
   //
-  // 这个**必须手填，没有任何"自动获取"的可能**：它只是你自己 .cnb.yml 里
-  // env 的一个值，CNB 的 OpenAPI 读不到工作区的 env（能读到就等于谁拿到
-  // 令牌都能读别人的密钥）。
+  // 这个**必须手填，没有任何"自动获取"的可能**：CNB 的 OpenAPI 读不到
+  // 工作区的 env（能读到就等于谁拿到令牌都能读别人的密钥）。
   //
-  // 一次登录加多个账号时也只问一次：PROXY_KEY 属于网关，不属于账号，
-  // 同一份 .cnb.yml 起的 cnb2api 用的是同一个 key，所有账号共用。
-  if (!inputs.proxyKey) {
-    return {
-      type: 'password',
-      key: 'proxyKey',
-      message: picked.list.length > 1
-        ? `PROXY_KEY（.cnb.yml 里的那个，通常 sk- 开头）—— 本次 ${picked.list.length} 个账号共用这一个`
-        : 'PROXY_KEY（你自己 .cnb.yml 里设的那个，通常 sk- 开头）—— 再加组织也是它，不会重复问',
-      placeholder: 'sk-…',
-    };
+  // 连续加几个仓库时，从第 2 个起不必再粘贴：先问「和上一个仓库相同 /
+  // 填一个不同的」，选相同就沿用（KEY_SAME），选不同才弹输入框。
+  const targets = targetsOf(inputs);
+  if (targets.length) {
+    const keys = keyMapOf(inputs, targets);
+    const pending = targets.find((t) => !keys.has(t.repo));
+    if (pending) {
+      const prevRepo = [...keys.keys()].slice(-1)[0] || '';
+      // 只有一个仓库时保持 inputs.proxyKey（静态 prompts 那条路也用它）
+      const keyName = targets.length === 1 ? 'proxyKey' : `proxyKey@${pending.repo}`;
+      const wanted = String(inputs[keyName] ?? '').trim();
+
+      if (!prevRepo || targets.length === 1) {
+        return {
+          type: 'password',
+          key: keyName,
+          message: `${targets.length === 1 ? '' : `${pending.repo} 的 `}`
+            + 'PROXY_KEY（这个仓库 .cnb.yml 里 env 的值，通常 sk- 开头）',
+          placeholder: 'sk-…',
+        };
+      }
+      if (wanted !== KEY_OTHER) {
+        return {
+          type: 'select',
+          key: keyName,
+          message: `${pending.repo} 的 PROXY_KEY（每个仓库各有一份）`,
+          options: [
+            {
+              label: '和上一个仓库相同',
+              value: KEY_SAME,
+              hint: `沿用 ${prevRepo} 填的那个`,
+            },
+            {
+              label: '填一个不同的',
+              value: KEY_OTHER,
+              hint: '这个仓库的 .cnb.yml 用了别的 PROXY_KEY',
+            },
+          ],
+        };
+      }
+      return {
+        type: 'password',
+        key: keyName,
+        message: `${pending.repo} 的 PROXY_KEY（这个仓库 .cnb.yml 里 env 的值）`,
+        placeholder: 'sk-…',
+      };
+    }
   }
 
   // 5) 还要加别的组织吗
@@ -1590,7 +1658,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       //
       //   CNB 访问令牌  → 调 CNB OpenAPI（查工作区、读日志、拉起工作区）
       //                   由 CNB 校验，形如 nkXXXXXXXX
-      //   PROXY_KEY     → 调你自己工作区里的 cnb2api 网关
+      //   PROXY_KEY     → 调那个仓库工作区里的 cnb2api 网关（每个仓库一份）
       //                   由 `.cnb.yml` 里的环境变量校验，通常形如 sk-xxx
       //
       // authorize 里当场校验 CNB 令牌，填错立刻报错，不等请求时才失败。
@@ -1606,7 +1674,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             { type: 'password', key: 'token', message: 'CNB 访问令牌（CNB → 头像 → 访问令牌）' },
             { type: 'text', key: 'org', message: '组织（org），例如 acme' },
             { type: 'text', key: 'repo', message: '仓库，例如 acme/my-gateway' },
-            { type: 'password', key: 'proxyKey', message: 'PROXY_KEY（.cnb.yml 里设的那个）' },
+            { type: 'password', key: 'proxyKey', message: 'PROXY_KEY（那个仓库 .cnb.yml 里 env 的值）' },
           ],
 
           // ---- 动态提问：一步一步来，每步都拉真实数据做成下拉 ----
@@ -1617,16 +1685,25 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
 
           async authorize(inputs) {
             const token = (inputs?.token || '').trim();
-            const proxyKey = (inputs?.proxyKey || '').trim();
             // 这次要添加的全部 (组织, 仓库)。可能只有一个，也可能连着加了几个。
             const targets = targetsOf(inputs);
+            // PROXY_KEY 是每个仓库各一份的，按仓库存、按仓库取（见 keyMapOf）
+            const keys = keyMapOf(inputs, targets);
             if (!token) return { type: 'failed', error: '请填写 CNB 访问令牌' };
-            if (!proxyKey) return { type: 'failed', error: '请填写 PROXY_KEY' };
+            // 缺 key 的仓库单独点名，别只说一句"请填写 PROXY_KEY"让人猜是哪个
+            const keyless = targets.filter((t) => !keys.get(t.repo)).map((t) => t.repo);
+            if (keyless.length) {
+              return {
+                type: 'failed',
+                error: `这些仓库还没填 PROXY_KEY：${keyless.join('、')}。`
+                  + 'PROXY_KEY 是每个仓库 .cnb.yml 里 env 的值，一个仓库一份，不能共用。',
+              };
+            }
 
             // ---- 1. 校验令牌，同时拿到这个账号的稳定身份 ----
             // 身份标识必须唯一，否则 magpie 会把两个账号当成同一个：
             // 「新的登录和已有账号标识相同时会替换那个账号；没有标识时比较密钥」。
-            // 多个账号常共用同一个 proxyKey，所以要给出独立的标识。
+            // 多个账号可能填同一个 proxyKey（同一份 .cnb.yml），所以要给出独立的标识。
             let me = null;
             try {
               const res = await fetch(`${CNB_API}/workspace/list?page=1&page_size=1`, {
@@ -1670,11 +1747,14 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               };
             }
 
-            if (token === proxyKey) {
+            // 令牌和 PROXY_KEY 填成同一个值：最常见的填反
+            const sameAsToken = targets.filter((t) => keys.get(t.repo) === token).map((t) => t.repo);
+            if (sameAsToken.length) {
               return {
                 type: 'failed',
-                error: '两栏填的是同一个值。CNB 访问令牌和 PROXY_KEY 是两个不同的东西：'
-                  + '前者在 CNB 个人设置里生成，后者是 .cnb.yml 里的 PROXY_KEY。',
+                error: `${sameAsToken.join('、')} 的 PROXY_KEY 和 CNB 访问令牌填的是同一个值。`
+                  + '两者完全不同：令牌在 CNB 个人设置里生成，PROXY_KEY 是那个仓库 '
+                  + '.cnb.yml 里 env 的值。',
               };
             }
 
@@ -1711,12 +1791,16 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             say(`登录成功：\n  ${notes.join('\n  ')}`);
 
             // 账号身份 = (CNB 用户, 组织/仓库)，且**不含 PROXY_KEY**：
-            // 多个账号通常填的是同一个 sk-xxx，只要掺进 key，不管组织/仓库
-            // 怎么选都会被判成同一个账号（magpie 靠身份相同来决定「替换已有
-            // 账号」还是「新增一个」）。repo 本身已经带组织，别再拼一次。
+            // 多个账号可能填同一个 sk-xxx（同一份 .cnb.yml），只要掺进 key，
+            // 不管组织/仓库怎么选都会被判成同一个账号（magpie 靠身份相同来
+            // 决定「替换已有账号」还是「新增一个」）。repo 本身已经带组织，
+            // 别再拼一次。
+            //
+            // 但 key 本身是**按仓库**存的：每个账号的 metadata.proxyKey 用它
+            // 自己那个仓库的值，loader 直接拿它当 apiKey。
             const metaOf = (t) => ({
               token,
-              proxyKey,
+              proxyKey: keys.get(t.repo),
               uid,
               username: username || undefined,
               // 身份串保持和显示名一致；@cnb.cool 只是让它在列表里看得出是 CNB 账号
@@ -1751,8 +1835,9 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
 
             return {
               type: 'success',
-              // key 存 proxyKey：magpie 会把它当 apiKey 发给 cnb2api
-              key: proxyKey,
+              // key 存这个仓库的 PROXY_KEY：magpie 会把它当 apiKey 发给 cnb2api。
+              // **不能是"上次填的那个"** —— 每个仓库的 key 都不一样。
+              key: mine.proxyKey,
               // api 类型只保留 type/key/metadata，顶层字段多会被丢弃；
               // 真正决定身份的是 metadata.email，所以它必须唯一。
               accountId: `cnb:${uid}:${mine.repo}`,
@@ -1839,7 +1924,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               const res = await send(first);
               // 401 说明 proxyKey 不对：补一句人话，并保留 401 让 magpie 标记账号
               if (res.status === 401) {
-                return annotate(res, 'cnb2api 拒绝了密钥：检查插件选项里的 proxyKey 是否等于 .cnb.yml 的 PROXY_KEY');
+                return annotate(res, `cnb2api 拒绝了密钥：检查这个仓库（${cfg.repo || '?'}）的 PROXY_KEY 是否等于它 .cnb.yml 里 env 的值`);
               }
               return res;
             } catch (e) {
