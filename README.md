@@ -148,67 +148,76 @@ magpie plugin login cnb2api
 
 ## 账号与组织
 
-先厘清两个维度，它们**不是一一对应**：
+三类信息的**粒度不同**，这是理解的起点：
 
-| 维度 | 决定什么 |
-|---|---|
-| **登录令牌**（谁的账号） | 能看到哪些工作区、能拉起哪个仓库 |
-| **组织**（org） | **AI credits 和核时按组织计费** |
+| 信息 | 粒度 | 说明 |
+|---|---|---|
+| 账号区分 | 用户 \| 组织/仓库 | 同组织下两个仓库算两个账号 |
+| 额度 | 用户 \| 组织 | AI credits 和核时按组织计，不细分到仓库 |
+| 工作区地址 | 用户 \| 组织/仓库 | 每个仓库有自己的工作区，地址各自独立 |
 
-插件把身份定义为 **(令牌持有者, 组织)** 的组合。同一组织下不同成员看到的
-额度是同一份；同一成员在不同组织下的额度是各自的。
+所以插件把身份定义为 **(用户, 组织/仓库)**：
+不同组织额度不同；同组织不同仓库额度相同、但地址不同。
 
-### 三种常见情形
+### 四种常见情形
 
 **① 多个独立账号，各看各的组织**
 
 ```
-alice+acme@cnb.cool      ← alice 的令牌，acme 组织的额度
-bob+beta@cnb.cool        ← bob 的令牌，beta 组织的额度
+alice@acme/gateway      ← alice 的令牌，acme 组织的额度
+bob@beta/proxy          ← bob 的令牌，beta 组织的额度
 ```
 
 两个账号的额度、地址、巡检完全独立。多个账号共用同一个 PROXY_KEY 也没问题。
 
 **② 主账号 + 团队成员账号**
 
-bob 被加进 acme 并把令牌也给了你——两个账号都能看到 acme 的额度（同一份），
+bob 被加进 acme 并把令牌也给了你——两个账号看到的是 acme 的同一份额度，
 但工作区归属各自的令牌：
 
 ```
-alice+acme@cnb.cool      ← 用 alice 的令牌拉起的工作区
-bob+acme@cnb.cool        ← 用 bob 的令牌拉起的工作区
+alice@acme/gateway      ← 用 alice 的令牌
+bob@acme/gateway        ← 用 bob 的令牌
 ```
 
-想用哪个账号的额度就在 magpie 里切哪个账号。**不要指望一个账号同时用两个组织的额度**
+想用哪个账号就在 magpie 里切哪个。**不要指望一个账号同时用两个组织的额度**
 ——CNB 不支持这种"合并"。
 
 **③ 一个主账号，名下多个组织（最常见）**
 
-alice 同时是 acme、gamma、delta 的成员，每个组织各有独立额度和独立工作区：
+alice 同时是 acme、gamma 的成员，每个组织各有独立额度和工作区：
 
 ```
-alice+acme@cnb.cool      → 额度 1166，地址 7mzc****-9001.cnb.run
-alice+gamma@cnb.cool     → 额度 500， 地址 xmjq****-9001.cnb.run
-alice+delta@cnb.cool     → 额度 2000，地址 ab12****-9001.cnb.run
+alice@acme/gateway      → 额度 1166，地址 7mzc****-9001.cnb.run
+alice@gamma/gateway     → 额度 500， 地址 xmjq****-9001.cnb.run
 ```
 
-**这是插件的关键行为**：同一个人、同一个令牌，选不同组织就是不同账号，
-额度和地址互不干扰。
+**④ 同组织下多个仓库**
+
+alice 在 acme 下有两个都跑着 cnb2api 的仓库：
+
+```
+alice@acme/gateway-a    → 额度 1166（共享），地址 7mzc****-9001.cnb.run
+alice@acme/gateway-b    → 额度 1166（共享），地址 ab12****-9001.cnb.run
+```
+
+额度是同一个（都属 acme），但地址和巡检完全独立——这样才能分别拉起。
 
 ### 怎么登录
 
-每个"组织 × 账号"组合各登一次：
+每个"账号 × 组织/仓库"组合各登一次：
 
 ```bash
-magpie plugin login cnb2api     # 填 alice 的令牌 → 选 acme
-magpie plugin login cnb2api     # 填 alice 的令牌 → 选 gamma
-magpie plugin login cnb2api     # 填 bob 的令牌 → 选 acme
+magpie plugin login cnb2api     # alice 的令牌 → 选 acme   → 选 acme/gateway
+magpie plugin login cnb2api     # alice 的令牌 → 选 gamma  → 选 gamma/gateway
+magpie plugin login cnb2api     # bob 的令牌   → 选 acme   → 选 acme/gateway
 ```
 
-登录表单里的组织下拉来自令牌实际可访问的组织列表，不会让你填错。
+组织和仓库都是下拉选择，选项来自令牌实际可访问的列表，不会让你填错。
 
-> 只有令牌只属于 **1 个组织**时才会自动跳过选择。
-> 有多个组织时一定会让你选——否则额度必然串。
+> **仓库必须选。** 地址是按仓库算的，不指定就不知道该跟哪个工作区。
+> 组织下只查到 1 个候选仓库时会自动选中；查到多个才让你挑；
+> 一个都没查到时手填报仓库名（组织用你上面选的）。
 
 ### 旧账号
 
@@ -355,7 +364,7 @@ magpie plugin options magpie-cnb2api '{"idleStopMinutes": 30}'
 |---|---|---|
 | `token` | — | CNB 访问令牌。**建议用登录表单填** |
 | `proxyKey` | — | `.cnb.yml` 里那个 PROXY_KEY |
-| `repo` | 自动 | 留空自动识别；填 `org/repo` 可固定 |
+| `repo` | — | **建议用登录表单选**。地址按仓库算，必须指定 |
 | `models` | `deepseek-v4.1-flash` | 逗号分隔 |
 | `branch` | `main` | 拉起工作区时用的分支 |
 | `checkSeconds` | `120` | 巡检间隔（秒） |
@@ -426,7 +435,7 @@ magpie quota             # 看当前额度
 |---|---|---|
 | `401` | 令牌无效或过期 | CNB → 头像 → 访问令牌，重新生成 |
 | 提示"缺少必需权限" | 令牌没勾 scope | 编辑令牌勾上后重启工作区 |
-| 仓库不存在 | `repo` 填错，或令牌无权访问 | 留空让它自动识别 |
+| 仓库不存在 | `repo` 填错，或令牌无权访问 | 核对组织/仓库是否正确 |
 | 地址是 placeholder | 还没取到地址 | 等 30–90 秒（工作区冷启动） |
 | 额度面板没有数字 | 缺 `group-resource:r` | 补勾后重试 |
 | `stop` 提示没权限 | 缺 `account-engage:rw` | 补勾后重试 |

@@ -322,20 +322,21 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   // 组织可能还没确定（repo 留空 → 自动发现），这时先按 token 归组，
   // 等 applyCredentials 拿到 org 后再迁移到带 org 的键上。
   // 账号在界面/日志/工具输出里的名字。
-  // 必须带上组织：同一用户的多个组织是两个独立账号，
-  // 都显示成「ikoude」就分不清谁是谁了。
+  // 粒度取到「组织/仓库」：同组织下两个仓库是两个账号，
+  // 只写用户名或只写组织都分不出来。
   //
-  // runtimeOrg 传运行时识别出的组织（旧账号没存 metadata.org，靠它补）。
-  function labelOf(auth, ctx, runtimeOrg) {
+  // runtimeRepo 传运行时识别出的仓库（旧账号没存，靠它补）。
+  function labelOf(auth, ctx, runtimeRepo) {
     const meta = auth?.metadata || {};
     const name = String(
-      meta.username || meta.email || meta.repo || auth?.label || ctx?.key || '',
+      meta.username || meta.email || auth?.label || ctx?.key || '',
     ).trim();
-    const org = String(meta.org || runtimeOrg || '').trim();
-    const label = org && name ? `${name}@${org}` : (name || ctx?.key || '');
-    return label.slice(0, 32);
+    const repo = String(meta.repo || runtimeRepo || '').trim();
+    const label = repo && name ? `${name}@${repo}` : (name || ctx?.key || '');
+    return label.slice(0, 48);
   }
 
+  // 组织：额度按它算。优先 metadata.org，其次仓库前缀。
   function orgOf(auth) {
     const meta = auth?.metadata || {};
     const fromRepo = String(meta.repo || '').includes('/')
@@ -344,9 +345,29 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return String(meta.org || fromRepo || '').trim();
   }
 
+  // 仓库：地址按它算。只有用户明确选了仓库才有值。
+  function repoOf(auth) {
+    const meta = auth?.metadata || {};
+    const r = normalizeRepo(meta.repo || '');
+    return r.includes('/') ? r : '';
+  }
+
+  // ctx 的键。
+  //
+  // 三个维度的粒度并不相同：
+  //   区分账号 / 工作区地址  → 用户 | 组织/仓库
+  //   额度                   → 用户 | 组织
+  //
+  // 所以键取到「组织/仓库」这一层：同组织下跑两个 cnb2api 仓库时，
+  // 地址和巡检必须各管各的；而额度天然只跟组织走，多个仓库落在同一组织
+  // 会显示同一份额度 —— 这是正确的，因为计费主体就是组织。
+  //
+  // 仓库没选时退回组织粒度，等 applyCredentials 拿到 repo 后再迁移。
   function keyOf(auth) {
     const meta = auth?.metadata || {};
     const token = String(meta.token || auth?.key || auth?.access || '').trim();
+    const repo = repoOf(auth);
+    if (repo) return `${fp(token)}@${repo}`;
     const org = orgOf(auth);
     return org ? `${fp(token)}@${org}` : fp(token);
   }
@@ -387,10 +408,10 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         }
         return fn(ctx);
       }).catch((e) => [`执行失败：${e.message}`]);
-      // refresh 之后 cfg.repo 才可能识别出来，这时才补得上组织后缀
+      // refresh 之后 cfg.repo 才可能识别出来，这时才补得上仓库后缀
       if (!String(ctx.label || '').includes('@')) {
-        const org = (ctx.cfg?.repo || '').split('/')[0];
-        if (org && ctx.label) ctx.label = `${ctx.label}@${org}`.slice(0, 32);
+        const repo = ctx.cfg?.repo || '';
+        if (repo && ctx.label) ctx.label = `${ctx.label}@${repo}`.slice(0, 48);
       }
       const head = multi ? `【${ctx.label || ctx.key}】` : '';
       const body = Array.isArray(lines) ? lines : [String(lines)];
@@ -1413,7 +1434,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     // 旧账号标签只有用户名，不补的话多组织会显示成同一个人。
     const c = cur();
     if (c && !String(c.label || '').includes('@')) {
-      c.label = labelOf(auth, c, (cfg.repo || '').split('/')[0]);
+      c.label = labelOf(auth, c, cfg.repo);
     }
   }
 
@@ -1506,27 +1527,26 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     };
   }
 
-  // 3) 仓库（只列该组织下、跑着 cnb2api 的）
-  // 用 repoAsked 标记"问过了"，否则用户留空时会一直重复问同一个问题（死循环）
+  // 3) 仓库（必选）。地址按仓库算，同组织下可能有多个 cnb2api 仓库，
+  //    不指定就不知道该跟哪个的地址。
   if (!inputs.repo && !inputs.repoAsked) {
     const found = await listCnbReposForLogin(token, inputs.org).catch(() => null);
     if (!found) {
+      // 查不到就手填，但不能留空
       return {
         type: 'text',
         key: 'repo',
-        message: '仓库名（自动查询失败，可留空让插件稍后自己识别）',
-        placeholder: '例如 my-gateway（留空即可）',
+        message: '仓库（自动查询失败，请手动填写，例如 my-gateway）',
+        placeholder: 'org/repo 或仓库名',
       };
     }
     if (!found.length) {
-      // 一个都没找到时，加个"跳过"选项，让用户能明确表示"让插件自己认"
+      // 组织里没查到，仍然要求填 —— 可能是刚建的仓库、或日志还没出现
       return {
-        type: 'select',
+        type: 'text',
         key: 'repo',
-        message: `组织 ${inputs.org} 下暂时没查到跑着 cnb2api 的仓库`,
-        options: [
-          { label: '（留空，稍后自动识别）', value: '', hint: '推荐' },
-        ],
+        message: `组织 ${inputs.org} 下没查到跑着 cnb2api 的仓库，请手动填写仓库名`,
+        placeholder: '例如 cnb2api（可只写仓库名，组织用上面选的）',
       };
     }
     if (found.length === 1) {
@@ -1600,8 +1620,12 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           label: 'CNB2API 凭据',
           // prompts 是给不支持动态提问的宿主用的静态兜底（OpenCode 只认这个）。
           // magpie 走下面的 ask()，能按已答内容动态生成下拉选项。
+          // 不支持动态提问的宿主（OpenCode 只认 prompts）用这组静态兜底。
+          // 组织/仓库必须问：额度按组织算、地址按仓库算，缺了就分不开。
           prompts: [
             { type: 'password', key: 'token', message: 'CNB 访问令牌（CNB → 头像 → 访问令牌）' },
+            { type: 'text', key: 'org', message: '组织（org），例如 acme' },
+            { type: 'text', key: 'repo', message: '仓库，例如 acme/my-gateway' },
             { type: 'password', key: 'proxyKey', message: 'PROXY_KEY（.cnb.yml 里设的那个）' },
           ],
 
@@ -1699,11 +1723,12 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
                 proxyKey,
                 uid,
                 username: username || undefined,
-                // 账号身份标识。额度按组织计，所以同一用户的不同组织
-                // 必须是两个独立账号 —— 把组织拼进 email 即可。
-                // 没选组织时保持原格式，避免已登录的账号被当成新的。
+                // 账号身份标识，粒度取到「组织/仓库」：
+                //   额度按组织算，地址按仓库算，
+                //   所以同组织下的两个仓库必须是两个独立账号（地址各管各的）。
+                // 仓库没选时退回组织粒度，避免已登录的旧账号被当成新的。
                 email: username
-                  ? (org ? `${username}+${org}@cnb.cool` : `${username}@cnb.cool`)
+                  ? `${username}+${repo && repo.includes('/') ? repo : org || '-'}@cnb.cool`
                   : undefined,
                 // 下拉里选定的组织/仓库。没选（自动跳过）时不写，交给自动识别。
                 org: org || undefined,
@@ -1725,7 +1750,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           applyCredentials(auth);   // 先读凭据，再启动轮询（顺序很关键）
           // cfg.repo 可能已经识别出来了，用它补齐组织后缀
           if (!ctx.label.includes('@')) {
-            ctx.label = labelOf(auth, ctx, (cfg.repo || '').split('/')[0]);
+            ctx.label = labelOf(auth, ctx, cfg.repo);
           }
           ensureTimer();
 
@@ -1853,21 +1878,19 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         // 或只在界面上看额度而不发消息），缺少这步 cfg.token 就是空的。
         applyCredentials(auth);
         if (!ctx.label.includes('@')) {
-          ctx.label = labelOf(auth, ctx, (cfg.repo || '').split('/')[0]);
+          ctx.label = labelOf(auth, ctx, cfg.repo);
         }
 
-        // 账号在界面上的名字。必须带组织：同一用户的多个组织是两个账号，
-        // 都显示成「ikoude」就分不开了。
+        // 账号在界面上的名字。粒度到「组织/仓库」：同组织下两个仓库
+        // 是两个账号，只写用户名或只写组织都分不开。
         // 不返回 user 的话宿主要拿 key 尾缀当名字（"API key …-key"）。
         const userName = String(
           auth?.metadata?.username || auth?.metadata?.email || auth?.name || '',
         ).trim();
-        // 旧账号没有 metadata.org，用运行时识别出的仓库前缀补
-        const authOrg = String(
-          auth?.metadata?.org || (cfg.repo || '').split('/')[0] || '',
-        ).trim();
+        // 旧账号没有 metadata.repo，用运行时识别出的仓库补
+        const authRepo = String(auth?.metadata?.repo || cfg.repo || '').trim();
         const accountName = userName
-          ? (authOrg ? `${userName}@${authOrg}` : userName)
+          ? (authRepo ? `${userName}@${authRepo}` : userName)
           : '';
         // usage 是登录/打开插件界面时最早被调的钩子，顺势主动拉一次。
         if (!state.uri) {
