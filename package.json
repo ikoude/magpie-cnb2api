@@ -1,7 +1,7 @@
 {
   "name": "magpie-cnb2api",
   "version": "0.1.0",
-  "description": "CNB workspace's cnb2api gateway as a magpie provider: follows the drifting cnb.run subdomain, restarts the workspace when it stops, shows real quota, and supports multiple accounts.",
+  "description": "Serve the cnb2api running in your own CNB workspace as a magpie provider: keeps up with the drifting *.cnb.run address, restarts the workspace when it stops, shows the workspace's real AI credits and core-hours, and keeps one account per user + org/repo.",
   "type": "module",
   "main": "./index.mjs",
   "files": [
@@ -21,8 +21,8 @@
     "name": "CNB2API",
     "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCIgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0Ij4KICA8cmVjdCB3aWR0aD0iNjQiIGhlaWdodD0iNjQiIHJ4PSIxNCIgZmlsbD0iIzE4NUZBNSIvPgogIDxwYXRoIGQ9Ik0xNCA0MCBMMzIgMjIgTDUwIDQwIiBmaWxsPSJub25lIiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iNSIKICAgICAgICBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz4KICA8Y2lyY2xlIGN4PSIzMiIgY3k9IjQ2IiByPSI0LjUiIGZpbGw9IiNmZmYiLz4KPC9zdmc+Cg==",
     "summary": {
-      "en": "Runs cnb2api inside your own CNB workspace and follows its address: restarts the workspace when it stops, reads the new subdomain, serves it to agents as one provider.",
-      "zh": "把你自己的 CNB 工作区里的 cnb2api 接成 magpie 供应商：地址变了自动跟随，工作区停了自动拉起。"
+      "en": "Turns the cnb2api in your own CNB workspace into a magpie provider. The workspace address changes on every restart and the workspace gets stopped by the platform — this follows the address and starts it again. It also shows the workspace's real AI credits and core-hours, and keeps one account per user and org/repo.",
+      "zh": "把你自己的 CNB 工作区里的 cnb2api 接成 magpie 供应商。工作区每次重启地址都会变、停了就完全没响应——插件负责跟住地址、并在停了之后把工作区拉起来；顺带把工作区的真实 AI credits 和核时显示到用量面板，多账号按「用户 + 组织/仓库」各算一个。"
     },
     "options": {
       "repo": "",
