@@ -312,9 +312,28 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return `a${h1.toString(36)}${h2.toString(36)}`;
   };
 
+  // ctx 的键 = (token 指纹, 组织)。
+  //
+  // 同一个 CNB 令牌可能能访问多个组织，而**额度是按组织计的**
+  // （GET /{org}/-/charge/quota 里的 org 就是计费主体）。
+  // 只按 token 分的话，同一账号下的两个组织会共用一份 ctx，
+  // 后填的组织把先填的覆盖掉，两个组织的额度显示成同一份。
+  //
+  // 组织可能还没确定（repo 留空 → 自动发现），这时先按 token 归组，
+  // 等 applyCredentials 拿到 org 后再迁移到带 org 的键上。
+  function orgOf(auth) {
+    const meta = auth?.metadata || {};
+    const fromRepo = String(meta.repo || '').includes('/')
+      ? String(meta.repo).split('/')[0]
+      : '';
+    return String(meta.org || fromRepo || '').trim();
+  }
+
   function keyOf(auth) {
     const meta = auth?.metadata || {};
-    return fp(String(meta.token || auth?.key || auth?.access || '').trim());
+    const token = String(meta.token || auth?.key || auth?.access || '').trim();
+    const org = orgOf(auth);
+    return org ? `${fp(token)}@${org}` : fp(token);
   }
 
   function ctxFor(auth) {
@@ -1635,8 +1654,12 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
                 proxyKey,
                 uid,
                 username: username || undefined,
-                // 每个 CNB 账号的唯一标识，用于区分多账号
-                email: username ? `${username}@cnb.cool` : undefined,
+                // 账号身份标识。额度按组织计，所以同一用户的不同组织
+                // 必须是两个独立账号 —— 把组织拼进 email 即可。
+                // 没选组织时保持原格式，避免已登录的账号被当成新的。
+                email: username
+                  ? (org ? `${username}+${org}@cnb.cool` : `${username}@cnb.cool`)
+                  : undefined,
                 // 下拉里选定的组织/仓库。没选（自动跳过）时不写，交给自动识别。
                 org: org || undefined,
                 repo: repo || undefined,
