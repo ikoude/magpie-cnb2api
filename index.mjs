@@ -2196,8 +2196,20 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             refreshInBackground('usage');
           }
 
+          // 账号名后那枚小徽标就是 plan 字段，magpie 原样显示。宿主不认中文，
+          // 所以中文在这里是安全的（不会被首字母大写或当作订阅计划转换）。
+          // 一律两字：字数一样，宽度才一样（.acc-line > .plan 另有 min-width: 3em，
+          // 中文字宽相同，于是四个账号的徽标在同一列上对齐）。
+          // 词与 workspace 行同源，只是缩到两字：运行 / 停止 / 未建 / 启动；
+          // 硬失败（令牌、仓库不存在）记"异常"，首屏还没查到记"未知"。
+          const planWord = state.fatal ? '异常'
+            : state.status === 'running' ? '运行'
+              : state.status === 'closed' ? '停止'
+                : state.status === 'none' ? '未建'
+                  : state.status === 'building' ? '启动'
+                    : '未知';
           const out = {
-            plan: state.status === 'running' ? 'running' : (state.status || 'unknown'),
+            plan: planWord,
             // 账号名用 CNB 用户名，多账号才能分清谁是谁
             ...(accountName ? { user: accountName } : {}),
           };

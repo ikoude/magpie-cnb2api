@@ -76,6 +76,10 @@ console.log('\n[1] 工作区已停止 + start 很慢：usage 不能等它');
   ok(credit && credit.used != null, `额度带读数 used=${credit?.used}`);
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
   ok(ws?.display === '已停止', `workspace 行只说状态，实际 ${ws?.display}`);
+  // 账号名后的徽标（plan）一律两字中文：字数一样宽度才一样，
+  // 四个账号的徽标才会落在同一列上。
+  ok(out.plan === '停止', `徽标是两字中文，实际 ${out.plan}`);
+  ok([...String(out.plan)].length === 2, `徽标固定两字，实际 ${out.plan}`);
 }
 
 console.log('\n[2] 额度接口 403（缺 group-resource:r）：写明原因，不能空白');
@@ -110,6 +114,7 @@ console.log('\n[3] 额度正常时仍然照常显示');
   ok(names[0] === 'AI credits' && names[1] === 'dev core-hours',
     `额度行从两个额度开始，实际 ${names.join(' / ')}`);
   ok(names.indexOf('workspace') >= 2, `workspace 不再占额度行的位置，实际 ${names.join(' / ')}`);
+  ok(out.plan === '运行', `运行中的徽标是"运行"，实际 ${out.plan}`);
 }
 
 console.log('\n[4] 地址不通：探活限时，不让面板干等');
@@ -174,7 +179,19 @@ console.log('\n[8] 首屏还没识别完：过渡态不要套额度结论');
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
   ok(ws?.display === '识别中', `过渡态只有一个词，实际 ${ws?.display}`);
   ok(!/已用尽/.test(ws?.display || ''), '过渡态不追加额度结论');
+  ok(out.plan === '未知', `还没查到状态时徽标是"未知"，实际 ${out.plan}`);
   world.empty = false; world.usedMilli = 300000; world.listDelayMs = 0;
+}
+
+console.log('\n[9] 仓库里没有工作区：徽标"未建"，不是英文 none');
+{
+  world.status = 'closed'; world.empty = true; world.listDelayMs = 0; world.chargeStatus = 200;
+  const { plugin, auth } = await boot();
+  const out = await plugin.auth.usage(async () => auth);
+  ok(out.plan === '未建', `徽标是"未建"，实际 ${out.plan}`);
+  const ws = (out.windows || []).find((w) => w.name === 'workspace');
+  ok(ws?.display === '无工作区', `workspace 行同样说无工作区，实际 ${ws?.display}`);
+  world.empty = false;
 }
 
 summary();
