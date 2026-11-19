@@ -549,25 +549,38 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   }
 
   // 取当前 ctx，没有就报错（说明有代码在账号作用域外碰了账号数据）
-  function need() {
+  function need(where) {
     const c = cur();
-    if (!c) throw new Error('内部错误 · 在账号作用域外访问账号数据');
+    if (!c) throw new Error(`内部错误 · 在账号作用域外访问 ${where || '账号数据'}`);
     return c;
   }
 
   // cfg / state 现在是"当前账号"的动态视图。
   // 这样几十处 cfg.xxx / state.xxx 的既有代码全都不用改，
   // 但语义已经变成按账号隔离。
+  //
+  // ⚠️ then/catch/finally 一律吞掉：这两个对象可能被下游 await 或 .catch()。
+  // 只要它长得像 thenable，引擎就会去读 .then 做解包，而那次解包发生在
+  // 账号作用域之外 —— 于是 need() 抛错、host 每 30 秒崩一次（已踩过）。
+  // 它们不是 Promise，如实说"没有"才是对的。
+  const NOT_PROMISE = new Set(['then', 'catch', 'finally']);
+
   const cfg = new Proxy({}, {
-    get(_, p) { return need().cfg[p]; },
-    set(_, p, v) { need().cfg[p] = v; return true; },
-    has(_, p) { return p in need().cfg; },
+    get(_, p) {
+      if (NOT_PROMISE.has(p)) return undefined;
+      return need(`cfg.${String(p)}`).cfg[p];
+    },
+    set(_, p, v) { need(`cfg.${String(p)}`).cfg[p] = v; return true; },
+    has(_, p) { return p in need(`cfg.${String(p)}`).cfg; },
   });
 
   const state = new Proxy({}, {
-    get(_, p) { return need().state[p]; },
-    set(_, p, v) { need().state[p] = v; return true; },
-    has(_, p) { return p in need().state; },
+    get(_, p) {
+      if (NOT_PROMISE.has(p)) return undefined;
+      return need(`state.${String(p)}`).state[p];
+    },
+    set(_, p, v) { need(`state.${String(p)}`).state[p] = v; return true; },
+    has(_, p) { return p in need(`state.${String(p)}`).state; },
   });
 
   const say = (msg) => {
@@ -881,13 +894,16 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return false;
   }
 
+  // 返回值是 undefined，**不要改成 return state**：state 是 Proxy，async 函数返回它
+  // 会让 await 那一侧去读 .then 做 thenable 解包，而解包发生在账号作用域之外 →
+  // need() 抛错、host 重启。调用方本来就没人用这个返回值（要状态直接读 state.xxx）。
   async function refresh(reason = 'tick') {
     state.lastCheck = Date.now();
     if (!cfg.token) {
       // 注意：不能设 fatal。config 阶段 token 还读不到（只存在于 loader 的 auth 里），
       // 这时设 fatal 会导致之后凭据补齐了也永远不再尝试。
       state.lastError = '尚未填写 CNB 访问令牌';
-      return state;
+      return;
     }
 
     // repo 没填（或只填了仓库名）就先归一/发现，只试一次。
@@ -901,7 +917,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         state.lastError = cfg.repo
           ? `无法补全仓库 ${cfg.repo}`
           : '未配置 repo 且自动发现失败 · 稍后重试';
-        return state;
+        return;
       }
       state.repoTried = true;
       state.repoTriedAt = Date.now();
@@ -911,12 +927,12 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           state.lastError = '未能确定仓库 · repo 为空且无法从工作区识别 cnb2api，'
             + '或仅填写名称而无法补全组织 · 请填写为 org/repo';
           // 不设 fatal：等一会儿可能就好了
-          return state;
+          return;
         }
         state.repoTried = false;
       } catch (e) {
         state.lastError = `仓库自动发现失败 · ${humanize(e)}`;
-        return state;
+        return;
       }
     }
 
@@ -928,13 +944,13 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         if (!(await repoExists(cfg.repo))) {
           state.lastError = `仓库 ${cfg.repo} 不存在或令牌无权访问`;
           state.fatal = true;
-          return state;
+          return;
         }
         state.lastError = `仓库 ${cfg.repo} 从未启动过工作区`;
         if (cfg.autoStart) {
           if (await startWorkspace()) state.recovering = true;
         }
-        return state;
+        return;
       }
       state.sn = ws.sn;
       state.status = ws.status;
@@ -949,7 +965,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           const started = await startWorkspace();
           state.recovering = started;
         }
-        return state;
+        return;
       }
 
       const ok = await resolveUri(ws.sn);
@@ -961,7 +977,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       if (e?.permission || /HTTP 401/.test(e.message || '')) state.fatal = true;
       if (state.failures === 1 || state.failures % 10 === 0) warn(`检查失败 · ${state.lastError}`);
     }
-    return state;
+    return;
   }
 
   // 解析并验活一次；成功则更新 state.uri
