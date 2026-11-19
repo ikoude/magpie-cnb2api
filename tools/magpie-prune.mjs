@@ -192,9 +192,37 @@ function note(file, key, label, last, why) {
   }
 }
 
+// ---------- 同一组织的多个账号标识 ----------
+// 账号名格式改过两次：早期「用户@cnb.cool」，后来「用户+组织@cnb.cool」，
+// 现在是「用户 | 组织/仓库@cnb.cool」。格式一变，同一个组织就会在
+// plugin-auth.json 里多留一条：两条都是活账号、额度各算一份。
+// 它们不是孤儿（删掉要重登），所以只报告，不进 findings、--apply 不碰。
+const shapeOf = (email) => {
+  const s = String(email || '').trim();
+  const cur = /^(.+?)\s\|\s*([^/|]+)\/([^@|]+)@cnb\.cool$/i.exec(s);
+  if (cur) return { user: cur[1].trim(), org: cur[2].trim(), format: '当前格式' };
+  const plus = /^([^+|]+)\+([^@|]+)@cnb\.cool$/i.exec(s);
+  if (plus) return { user: plus[1].trim(), org: plus[2].trim(), format: '旧格式（加号拼组织）' };
+  const plain = /^([^@|+]+)@cnb\.cool$/i.exec(s);
+  if (plain) return { user: plain[1].trim(), org: '', format: '旧格式（只有用户）' };
+  return { user: s.toLowerCase(), org: '', format: '无法识别' };
+};
+
+const byOrg = new Map();          // "用户|组织"（小写） → [{ key, email, org, format }]
+for (const [k, v] of Object.entries(auth)) {
+  if (!k.startsWith(PROVIDER)) continue;
+  const email = String(v?.metadata?.email || '').trim();
+  if (!email) continue;
+  const s = shapeOf(email);
+  const id = `${s.user.toLowerCase()}|${s.org.toLowerCase()}`;
+  if (!byOrg.has(id)) byOrg.set(id, []);
+  byOrg.get(id).push({ key: k, email, org: s.org, format: s.format });
+}
+const siblings = [...byOrg.values()].filter((g) => g.length > 1);
+
 // ---------- 输出 ----------
 if (JSON_OUT) {
-  console.log(JSON.stringify({ dir: DIR, apply: APPLY, live: [...live.values()], findings }, null, 2));
+  console.log(JSON.stringify({ dir: DIR, apply: APPLY, live: [...live.values()], findings, siblings }, null, 2));
 } else {
   console.log(`magpie 数据目录：${DIR}`);
   console.log(`仍在的 ${PROVIDER} 账号 ${live.size} 个：${[...live.values()].join('、') || '（无）'}`);
@@ -217,12 +245,33 @@ if (JSON_OUT) {
     }
     console.log(`共 ${findings.length} 条孤儿缓存。`);
   }
+
+  if (siblings.length) {
+    console.log('');
+    console.log(`⚠ 同一组织存在多个账号标识：${siblings.length} 组`);
+    for (const g of siblings) {
+      console.log(`  组织 ${g[0].org || '（未识别）'}`);
+      for (const a of g) {
+        console.log(`    · ${a.email}   [${a.format}]   ${a.key}`);
+      }
+    }
+    console.log('');
+    console.log('  都属于同一组织，额度会被算成两份、面板上出现两个同名账号。');
+    console.log('  处理办法：在面板里删掉旧格式那个账号，再登录一次（旧额度历史可用本脚本清理）。');
+    console.log('  注意 --apply 不会动这些条目：它们是活账号，删了需要重新登录。');
+  }
 }
 
 if (!APPLY) {
-  if (findings.length && !JSON_OUT) {
-    console.log('');
-    console.log('这只是预览。确认无误后加 --apply 执行（会先备份，且 magpie 必须在退出状态）。');
+  if (!JSON_OUT) {
+    if (findings.length) {
+      console.log('');
+      console.log('这只是预览。确认无误后加 --apply 执行（会先备份，且 magpie 必须在退出状态）。');
+    }
+    if (siblings.length && !findings.length) {
+      console.log('');
+      console.log('没有可自动清理的条目：上面的账号都还在用，需要你在面板里手动处理。');
+    }
   }
   process.exit(0);
 }
