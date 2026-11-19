@@ -297,35 +297,37 @@ PROXY_KEY 的粒度是**仓库**，不是账号，也不是网关：
 
 ### 6.1 面板结构
 
+面板的账号卡把窗口排成一条**额度行**：只排前两个窗口，其余只进悬停提示。
+所以额度排在前面，工作区状态排在它们之后：
+
 ```
-alice | acme/gateway     workspace       就绪 · 1a2b****-9001.cnb.run
-                         AI credits  67%  (已用 800 / 1200 cr · 赠送 +600 · 冻结 0 · 可用 400)
-                         dev core-hours 0% (已用 4.4 / 1600 h · 赠送 +1024 · 冻结 15 · 可用 1580)
+alice | acme/gateway      closed  ⟳                          首选
+   AI credits      ▬▬▬▬▬  800 / 1200 cr · 已用 67%
+   dev core-hours  ▬      4.4 / 1600 h · 已用 0.3%
 
-alice | beta/gateway     workspace       运行中 · 3c4d****-9001.cnb.run
-                         AI credits 100%  (已用尽 · 1200 / 1200 cr · 赠送 +600 · 冻结 0 · 可用 0)
-                         dev core-hours 3% (已用 48 / 1600 h · 赠送 +1024 · 冻结 0 · 可用 1552)
-
-alice | gamma/gateway    workspace       已停止
-                         AI credits   0%  (已用 0 / 1200 cr · 赠送 +600 · 冻结 100 · 可用 1100)
-                         dev core-hours 0% (已用 0 / 1600 h · 赠送 +1024 · 冻结 0 · 可用 1600)
+alice | beta/gateway      running ⟳                        设为首选
+   AI credits      ▬▬▬▬▬  1200 / 1200 cr · 已用 100%
+   dev core-hours  ▬      48 / 1600 h · 已用 3%
 ```
 
-首列为账号名 `用户 | 组织/仓库`。存在多个组织或仓库时，仅凭用户名或组织无法定位，
-必须包含仓库。每个账号下固定三行，各管一件事，不互相重复：
+| 顺序 | 窗口 | 回答的问题 |
+|---|---|---|
+| 1 | `AI credits` | credits 还剩多少（余额为 0 时行首标 `已用尽`） |
+| 2 | `dev core-hours` | 核时还剩多少 |
+| 3 | `workspace` | 工作区在不在、地址通不通（面板里在悬停提示中；一句话版见账号名后的徽标） |
+| 4 | `AI credits 明细` / `dev core-hours 明细` | 纯文字明细，只给读不到进度条的卡片用 |
 
-| 行 | 回答的问题 |
-|---|---|
-| `workspace` | 工作区在不在、地址通不通 |
-| `AI credits` | credits 还剩多少（余额为 0 时行首标 `已用尽`） |
-| `dev core-hours` | 核时还剩多少 |
+前两位是额度、不是 `workspace`，因为额度行只有一行：`workspace` 若排第一，
+credits 就会被挤到同一行右侧，工作区状态和额度混读成一句。
+`magpie quota`（终端）按同一顺序列出全部窗口，`workspace` 紧跟额度之后。
 
-额度相关的话术只出现在下面两行，`workspace` 行不夹带，避免同一句话读两遍。
+额度相关的话术只出现在额度行，`workspace` 行不夹带，避免同一句话读两遍。
 
 ### 6.2 工作区状态行
 
 该行回答「工作区在不在、地址通不通」，格式统一为 `<状态词> · <地址或原因>`，
-段间用 ` · `、句内补充用 `，`。状态词只有七个：
+段间用 ` · `、句内补充用 `，`。面板的额度行只放额度，这条行出现在额度之后的
+悬停提示里；账号名后的徽标给出同一状态的一句话版（`closed` / `running` / `none`）。状态词只有七个：
 
 | 状态词 | 含义 | 后面跟 |
 |---|---|---|
@@ -605,7 +607,7 @@ npm test     # 6 个测试文件，各自独立进程
 | `test/login-multi-org.test.mjs` | 一次登录写多个账号：账号 id 稳定、key 按仓库、宿主不支持时的降级 |
 | `test/smoke.test.mjs` | 登录问答顺序、usage 面板结构、两个工具的输出 |
 | `test/quota-gate.test.mjs` | 额度用尽不启动、结论缓存、402 翻译、额度恢复后补启动 |
-| `test/usage.test.mjs` | 面板不被启动与探活拖住、查不到额度时写明原因 |
+| `test/usage.test.mjs` | 面板不被启动与探活拖住、查不到额度时写明原因、额度行由两个额度打头 |
 | `test/ready-retry.test.mjs` | 工作区停止后等到新地址再重试 |
 
 测试以假的 `fetch` 替代网络，不访问 CNB，也不读写 `~/.config/magpie`；`test/` 不包含在 npm 包内。

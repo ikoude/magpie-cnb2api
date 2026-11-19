@@ -2211,12 +2211,20 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           const running = state.status === 'running';
           const alive = state.uri && running ? await health(state.uri, 1500) : false;
           const host = state.uri ? hostOf(state.uri) : '';
+          //
+          // 顺序即版面：账号卡的额度行（.acc .aq）是**一行** flex 容器，
+          // 只排前两个窗口，其余只进悬停提示。workspace 曾经排第一，于是
+          // 额度被挤到同一行右侧，读起来像"工作区状态 + 额度"挤在一起。
+          // 现在额度先排，workspace 和它的补充说明排到最后：那一行就是
+          // 额度行，工作区状态由账号名后的 plan 徽标与悬停提示给出。
           const wsRow = { name: 'workspace', aside: true, display: '' };
-          out.windows = [wsRow];
+          out.windows = [];
+          const later = [];         // 不占额度行的窗口：补充说明 + workspace
+          const details = [];       // 明细排在两个额度之后，免得占掉第二个位置
 
           // 1b) 自动重启状态：权限不够时明确告诉用户"能跟随但不会重启"
           if (cfg.autoStart && state.status !== 'running' && state.autoStartBlocked) {
-            out.windows.push({
+            later.push({
               name: 'auto-restart',
               aside: true,
               display: '已关闭 · 缺少 repo-cnb-trigger:rw',
@@ -2275,7 +2283,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               creditDead = q?.credit?.remain != null && q.credit.remain <= 0;
               if (q?.credit && q.credit.used != null) {
                 out.windows.push(progressWindow('AI credits', 'cr', q.credit, creditDead));
-                out.windows.push(detailWindow('AI credits', 'cr', q.credit));
+                details.push(detailWindow('AI credits', 'cr', q.credit));
               } else if (q?.credit) {
                 // 总额拿到了、已用量没拿到（volume 单独失败）：能显示就别空着
                 const c = q.credit;
@@ -2292,7 +2300,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               }
               if (q?.devHours && q.devHours.used != null) {
                 out.windows.push(progressWindow('dev core-hours', 'h', q.devHours));
-                out.windows.push(detailWindow('dev core-hours', 'h', q.devHours));
+                details.push(detailWindow('dev core-hours', 'h', q.devHours));
               }
             } catch (e) {
               out.error = `额度查询失败 · ${e.message}`;
@@ -2311,6 +2319,10 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           if (process.env.CNB2API_SHOW_FULL_HOST === '1' && alive && host) {
             wsRow.display = wsRow.display.replace(maskHost(host), host);
           }
+          // 版面收尾：两个额度 → 补充说明 → workspace → 明细。
+          // 面板额度行（前两个）因此是"AI credits · dev core-hours"，
+          // 工作区状态不再和额度抢同一行；终端里状态也紧跟额度，明细垫后。
+          out.windows.push(...later, wsRow, ...details);
           return out;
         });
       },

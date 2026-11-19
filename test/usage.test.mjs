@@ -104,6 +104,12 @@ console.log('\n[3] 额度正常时仍然照常显示');
   ok(!/已用 300/.test(credit?.display || ''), '进度行不再重复数字');
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
   ok(/^就绪 · /.test(ws?.display || ''), `可用时写就绪，实际 ${ws?.display}`);
+  // 版面：账号卡的额度行只排前两个窗口，workspace 若排第一就会把额度挤到
+  // 同一行右侧。两个额度必须占据前两位，workspace 落在后面（悬停提示里）。
+  const names = (out.windows || []).map((w) => w.name);
+  ok(names[0] === 'AI credits' && names[1] === 'dev core-hours',
+    `额度行从两个额度开始，实际 ${names.join(' / ')}`);
+  ok(names.indexOf('workspace') >= 2, `workspace 不再占额度行的位置，实际 ${names.join(' / ')}`);
 }
 
 console.log('\n[4] 地址不通：探活限时，不让面板干等');
