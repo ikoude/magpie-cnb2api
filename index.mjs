@@ -351,6 +351,25 @@ function bucket(total, used, frozen, pre, scale) {
   };
 }
 
+// 用 token 派生一个稳定的短键（指纹）。不要直接用 token，避免它出现在
+// Map key、日志或调试输出里；也不用加密哈希，滚动哈希对"不暴露原文"够用。
+//
+// 两处在用：ctx 的键（token 指纹 + 组织），以及多账号补写时的账号 id
+// （cnb2api#<内容指纹>）—— 后者是 magpie 的持久化键，稳定才意味着
+// "再登一次是覆盖自己"，所以要能被测试盯住。
+const fp = (token) => {
+  const s = String(token || '').trim();
+  if (!s) return 'anonymous';
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 + c, 0x85ebca6b) >>> 0;
+  }
+  return `a${h1.toString(36)}${h2.toString(36)}`;
+};
+
 const hostOf = (u) => { try { return new URL(u).host; } catch { return u || ''; } };
 
 // 把工作区域名打码：860lo2zlkf-9001.cnb.run → 860l****-9001.cnb.run
@@ -425,21 +444,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       label: '',                  // 写日志时区分账号
     };
   }
-
-  // 用 token 派生一个稳定的短键（指纹）。不要直接用 token，避免它出现在
-  // Map key、日志或调试输出里；也不用加密哈希，滚动哈希对"不暴露原文"够用。
-  const fp = (token) => {
-    const s = String(token || '').trim();
-    if (!s) return 'anonymous';
-    let h1 = 0x811c9dc5;
-    let h2 = 0x01000193;
-    for (let i = 0; i < s.length; i++) {
-      const c = s.charCodeAt(i);
-      h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
-      h2 = Math.imul(h2 + c, 0x85ebca6b) >>> 0;
-    }
-    return `a${h1.toString(36)}${h2.toString(36)}`;
-  };
 
   // ctx 的键 = (token 指纹, 组织)。
   //
@@ -2347,5 +2351,5 @@ export const _internal = {
   pickUri, pickUriFromLog, strip, materialize, opts, normalizeRepo,
   PERMISSIONS, explainScope, scopeReport,
   // 纯函数层：额度配平、数值格式、地址打码
-  bucket, specialOf, bonusPart, num1, maskHost, tsOf,
+  bucket, specialOf, bonusPart, num1, maskHost, tsOf, fp,
 };

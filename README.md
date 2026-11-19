@@ -533,12 +533,13 @@ npx magpie-cnb2api-prune --apply    # 执行，自动备份
 源码为单个 `index.mjs`，按「纯函数 → 账号作用域 → CNB OpenAPI → 状态机 → 登录流程 → 宿主协议」分段，文件头有索引。无运行时依赖，要求 Node ≥ 20。
 
 ```bash
-npm test     # 5 个测试文件，各自独立进程
+npm test     # 6 个测试文件，各自独立进程
 ```
 
 | 文件 | 覆盖内容 |
 |---|---|
 | `test/pure.test.mjs` | 额度配平、特权解析、地址打码、日志取地址、仓库名归一 |
+| `test/login-multi-org.test.mjs` | 一次登录写多个账号：账号 id 稳定、key 按仓库、宿主不支持时的降级 |
 | `test/smoke.test.mjs` | 登录问答顺序、usage 面板结构、两个工具的输出 |
 | `test/quota-gate.test.mjs` | 额度用尽不启动、结论缓存、402 翻译、额度恢复后补启动 |
 | `test/usage.test.mjs` | 面板不被启动与探活拖住、查不到额度时写明原因 |
