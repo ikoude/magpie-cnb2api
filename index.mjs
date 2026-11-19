@@ -2,7 +2,7 @@
 //
 // 解决两件事，都由插件自己的 setInterval 在 Bun 层完成：
 //   1. 地址漂移：工作区每次重启，<subdomain>-<port>.cnb.run 都会变；
-//   2. 工作区停止：平台会杀掉工作区，这里自动调 OpenAPI 重新拉起。
+//   2. 工作区停止：平台会杀掉工作区，这里自动调 OpenAPI 重新启动。
 //
 // 两条取地址的路子都试，谁先成功用谁：
 //   a) GET /{repo}/-/workspace/detail/{sn} 的 webide 字段（快，不用拉日志）
@@ -10,6 +10,14 @@
 //
 // loader 返回的 baseURL 是动态读的，所以地址一变，下一次请求就自动走新地址，
 // 不需要重装、不需要重启 magpie，也不需要用户在界面上点任何东西。
+//
+// 文件结构（按阅读顺序，段首都有同名横幅）：
+//   纯函数        地址解析、令牌权限、数值与显示 —— 不依赖账号状态
+//   账号作用域    每个账号一份 ctx；cfg / state 是指向"当前账号"的视图
+//   CNB OpenAPI   列表、日志、额度、启动；把 403 翻成"该勾哪个权限"
+//   状态机        refresh → 选工作区 → 取地址 → 探活；额度闸门决定是否启动
+//   登录流程      ask() 五步问答 + authorize 校验（状态全放在用户答案里）
+//   宿主协议      config / loader(fetch 改写) / usage(额度面板) / tool
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 
@@ -117,8 +125,7 @@ function pickUriFromLog(text, port = 9001) {
   return null;
 }
 
-// ---------------------------------------------------------------------------
-// 令牌权限清单
+// ---------- 纯函数 · 令牌权限 ----------
 //
 // 每项写明：scope、必需性、对应哪个接口、缺了会怎样。
 // 插件启动后主动探测一遍，把缺少的权限用人话报出来。
@@ -227,14 +234,144 @@ function scopeReport() {
   }));
 }
 
+// ---------- 纯函数 · 数值与显示 ----------
+//
+// 这一层保证"给定接口字段，算出面板和工具要显示的东西"，不碰账号状态。
+// 放在模块作用域：可以单独验证（见文件末尾 _internal），也让下面那个上千行
+// 的插件函数只专注"账号状态 + 宿主协议"。
+//
+// 额度接口的三点口径（不合上面三条就会显示错数字）：
+//   1. 单位：*_in_milli ÷ 1000 = credits；*_in_sec ÷ 3600 = 核时
+//   2. volume 是扁平数字（已用量），quota 才是 {total, free} 对象
+//   3. quota.total 已包含 special-amount 的加成，基础额度必须减掉它
+//
+// 工作区的时间字段是 create_time（不是 created_at），
+// 兼容几种可能的写法，取不到就退回 0（保持原序）。
+const tsOf = (w) => {
+  for (const k of ['create_time', 'createTime', 'created_at', 'updated_at']) {
+    const t = Date.parse(w?.[k] || '');
+    if (Number.isFinite(t)) return t;
+  }
+  return 0;
+};
+
+const num = (v) => {
+  if (v == null) return null;
+  const n = typeof v === 'object' ? Number(v.total ?? NaN) : Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+
+const round1 = (n) => Math.round(Number(n) * 10) / 10;
+
+// 数值显示：整数不拖 .0，小数留一位，保证各账号格式统一
+const num1 = (n) => {
+  const v = round1(n);
+  return Number.isInteger(v) ? String(v) : v.toFixed(1);
+};
+// 2026-10-31T15:59:59Z → 2026-10-31
+const fmtDate = (s) => String(s || '').slice(0, 10);
+
+// 加成那一段的文案。三种情况必须分开，否则会误导用户：
+//   有加成未过期 → 「天才程序员专属特权 +666（2026-12-31 到期）」
+//   有加成已过期 → 「天才程序员专属特权 +666 已过期」   ← 不能还写 "+666" 让人以为可用
+//   没有加成     → 空字符串（不显示，别出现 "加成 +0" 这种噪音）
+function bonusPart(amount, desc, expire, expired) {
+  if (amount == null) return '';
+  const label = desc || '赠送';
+  if (expired) return `${label} +${num1(amount)} 已过期`;
+  return expire ? `${label} +${num1(amount)} · 有效期至 ${fmtDate(expire)}` : `${label} +${num1(amount)}`;
+}
+
+// 加成本身可为 null / 0（没有特权的账号就是这样），要能区分「没有」和「不知道」
+const positive = (v) => {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : null;
+};
+
+// 从 {credit, credit_desc, credit_expire} 这类三元组里取出有效的那项。
+// 注意：接口会返回**已过期**的加成（quota 里可能也已经扣掉了），
+// 所以要带出 expired 标记，让显示层能说"已过期"而不是继续吹 "+666"。
+//
+// 注意字段名：值叫 compute_develop_corehour，
+// 但说明和过期时间叫 compute_develop_desc / compute_develop_expire（**没有 _corehour**）。
+// 不传 baseKey 时按 `${key}_desc` 拼，传了就优先用它。
+function specialOf(special, key, unitScale, baseKey = null, now = Date.now()) {
+  if (!special) return null;
+  const amount = positive(special[key]);
+  if (amount == null) return null;
+  const stem = baseKey || key;
+  const desc = String(special[`${stem}_desc`] ?? '').trim();
+  const expireRaw = String(special[`${stem}_expire`] ?? '').trim();
+  // 9999 年那种「永不过期」当成没有期限
+  const expire = expireRaw && !/^9999/.test(expireRaw) ? expireRaw : null;
+  const expiresAt = expire ? Date.parse(expire) : null;
+  const expired = expiresAt != null && Number.isFinite(expiresAt) && expiresAt < now;
+  return {
+    amount: amount / unitScale,
+    desc: desc || null,
+    expire,
+    expired,
+  };
+}
+
+// 额度三元组（总额 / 已用 / 冻结 / 特权）的通用算法。
+//
+// credits 和核时的字段口径完全一致，只是一个以 milli 计、一个以秒计。
+// 两段一模一样的算式以前是复制粘贴的，改一处忘一处就会让面板上两个
+// 窗口的数字对不上，所以合成一个。
+//
+// scale = 1 个显示单位对应多少原始单位（credits 1000、核时 3600）。
+// pre   = 特权注解（specialOf 的返回值），null 表示没有特权。
+// 返回 null 表示总额没拿到，调用方就不显示这一项。
+//
+// ⚠️ 口径：total / used / frozen 用接口的原始单位（milli 或秒），
+// pre.amount 却是显示单位，所以下面乘了一次 scale —— 全函数只有这一处换算。
+function bucket(total, used, frozen, pre, scale) {
+  if (total == null) return null;
+  // 关键：total 已经包含特权，基础额度必须减掉特权，否则 666 会被算两次
+  const specialRaw = pre?.amount != null ? pre.amount * scale : null;
+  const baseRaw = specialRaw != null ? total - specialRaw : total;
+  // 可用 = 总额 - 已用 - 冻结；明明超了也要显示 0，不能出现负数
+  const remainRaw = Math.max(0, total - (used || 0) - frozen);
+  return {
+    total: total / scale,
+    used: used != null ? used / scale : null,
+    frozen: frozen / scale,
+    bonus: pre?.amount ?? null,
+    base: baseRaw / scale,
+    remain: remainRaw / scale,
+    // 已用率 / 已用+冻结率，都基于总额（不是基础额度）算
+    usedPct: used != null ? (used / total) * 100 : null,
+    usedFrozenPct: total > 0 ? ((used || 0) + frozen) / total * 100 : null,
+    bonusDesc: pre?.desc ?? null,
+    bonusExpire: pre?.expire ?? null,
+    bonusExpired: pre?.expired ?? false,
+  };
+}
+
+const hostOf = (u) => { try { return new URL(u).host; } catch { return u || ''; } };
+
+// 把工作区域名打码：860lo2zlkf-9001.cnb.run → 860l****-9001.cnb.run
+// 保留前 4 位是为了"自己认得出是哪个"，保留端口和域名是为了"看得出是否正常"。
+const maskHost = (host) => {
+  const h = String(host || '');
+  if (!h) return '';
+  // cnb.run 的子域形如 <12位随机>-<端口>.<域名>
+  const m = h.match(/^([^-]+)-(\d+\..+)$/);
+  // 端口与域名原样保留：看得出是不是 9001、是不是 cnb.run
+  if (m) return `${m[1].slice(0, 4)}****-${m[2]}`;
+  // 其他形态：保留前 4 后 4，中间打码
+  if (h.length <= 10) return h;
+  return `${h.slice(0, 4)}****${h.slice(-4)}`;
+};
+
 export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
-  // ---------------------------------------------------------------------------
-  // 多账号：状态按账号隔离
+  // ---------- 账号作用域 ----------
   //
+  // 多账号：状态按账号隔离。
   // 插件函数只被调用一次，所有账号共用同一份闭包，所以 state/cfg 不能放在
   // 闭包顶层，否则第二个账号会覆盖第一个的 token/repo/地址。
   // 每个账号一份 ctx，用 token 的指纹（不是 token 本身，避免日志泄漏）做键。
-  // ---------------------------------------------------------------------------
   const ctxs = new Map();          // key → ctx
 
   // 本次进程里已经配过账号的组织。只用于登录流程的提示：
@@ -261,7 +398,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       // 避免并发请求各自跑一遍 refresh + waitForReady。
       recoveringPromise: null,
       autoStartBlocked: false,
-      // 拉起前的额度闸门：quotaGate 是这次查询的缓存（含"可用"结论），
+      // 启动前的额度闸门：quotaGate 是这次查询的缓存（含"可用"结论），
       // quotaBlocked 只在真被拦下时有值，供报错/工具输出引用。
       quotaGate: null,
       quotaBlocked: null,
@@ -441,7 +578,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     console.warn(`[cnb2api] ${line}`);
   };
 
-  // ---------- OpenAPI ----------
+  // ---------- CNB OpenAPI ----------
   async function api(path, init = {}) {
     if (!cfg.token) throw new Error('尚未填写 CNB 访问令牌');
     // timeout 是本函数的私有参数：直接 spread 进 fetch 既不生效也不报错，
@@ -494,20 +631,11 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     const j = await res.json();
     const list = j.list || j.data || [];
     // 服务端理论上按 slug 过滤了，但本地再筛一遍：
-    // 宁可多这一步，也不能误用别的仓库的工作区（会去读错日志、甚至拉起错仓库）
+    // 宁可多这一步，也不能误用别的仓库的工作区（会去读错日志、甚至启动错仓库）
     if (!cfg.repo) return list;
     return list.filter((w) => (w.slug || w.repo_url) === cfg.repo);
   }
 
-  // 工作区的时间字段是 create_time（不是 created_at），
-  // 兼容几种可能的写法，取不到就退回 0（保持原序）。
-  const tsOf = (w) => {
-    for (const k of ['create_time', 'createTime', 'created_at', 'updated_at']) {
-      const t = Date.parse(w?.[k] || '');
-      if (Number.isFinite(t)) return t;
-    }
-    return 0;
-  };
 
   // 同一仓库可能有多个工作区实例（每次启动/关闭都留一条）。
   // 实测一个仓库能攒到 9 条（1 running + 8 closed）。挑选顺序：
@@ -571,12 +699,12 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     }
   }
 
-  // ---------- 拉起前的额度闸门 ----------
+  // ---------- 状态机 · 额度闸门 ----------
   //
   // cnb2api 是 AI 网关：所属组织的 AI credits 一旦用尽，它对每个请求都回
   //   402 [EXCEEDING_LIMIT] AI 积分已用尽
-  // 这时候把工作区拉起来只会白烧核时 —— 还得再等 30~90 秒冷启动，最后仍然
-  // 只拿到 402。所以拉起之前先查一次额度，用尽就直接不拉。
+  // 这时候启动工作区只会白烧核时 —— 还得再等 30~90 秒冷启动，最后仍然
+  // 只拿到 402。所以启动之前先查一次额度，用尽就不启动。
   //
   // 原则是**查不到就放行**：缺 group-resource:r、接口临时抽风、字段换了名字，
   // 都不能当成"额度用尽"。拦住一个本来能用的工作区，比放过一个注定 402 的更糟。
@@ -590,7 +718,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   }
 
   // 返回 null = 可以拉；返回对象 = 用尽了，别拉。
-  // fresh = 不信缓存，现查一次：用户刚充完额度就又点"拉起"，不该被
+  // fresh = 不信缓存，现查一次：用户刚充完额度就又点"启动"，不该被
   // 一分钟前的旧结论挡住。
   async function quotaGate(fresh = false) {
     const org = String(cfg.repo || '').split('/')[0];
@@ -612,8 +740,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return blocked;
   }
 
-  // 返回 true = 已经提交（或正在提交）拉起；false = 没拉起来。
-  // 调用方靠它决定要不要把 state.recovering 置上：没拉起来还标"正在恢复"，
+  // 返回 true = 已经提交（或正在提交）启动；false = 没启动。
+  // 调用方靠它决定要不要把 state.recovering 置上：没启动起来还标"正在恢复"，
   // 会让后面的请求白等 90 秒去拿一个注定拿不到的地址。
   //
   // 提交成功后 START_COOLDOWN_MS 内不再重复提交：waitForReady 每 6 秒
@@ -622,7 +750,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   const START_COOLDOWN_MS = 60_000;
 
   async function startWorkspace(freshQuota = false) {
-    // 已有一次在飞：算"正在拉起"，让并发调用方一起等它，而不是各自再发一次
+    // 已有一次在飞：算"正在启动"，让并发调用方一起等它，而不是各自再发一次
     if (state.starting) return true;
     // 冷却期对显式调用同样有效：刚刚提交过就不该再提交一次
     if (state.startAt && Date.now() - state.startAt < START_COOLDOWN_MS) return true;
@@ -790,7 +918,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       const ws = await pickWorkspace();
       if (!ws) {
         state.status = 'none';
-        // 先确认这个仓库到底存不存在：填错名字时不该反复尝试拉起
+        // 先确认这个仓库到底存不存在：填错名字时不该反复尝试启动
         if (!(await repoExists(cfg.repo))) {
           state.lastError = `仓库 ${cfg.repo} 不存在或令牌无权访问`;
           state.fatal = true;
@@ -873,7 +1001,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       if (isReady()) return true;
       // token 无效 / 权限不足是确定性的，再等也不会好，立即放弃
       if (state.fatal) return false;
-      // 额度用尽同理：工作区根本没被拉起，再等也等不出地址
+      // 额度用尽同理：工作区根本没被启动，再等也等不出地址
       if (state.quotaBlocked) return false;
       const left = deadline - Date.now();
       if (left <= 0) break;
@@ -908,102 +1036,10 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   //   GET /{org}/-/charge/volume         → { credit_in_milli: 496130, dev_in_sec: 440648, freeze_*: ... }
   //   GET /{org}/-/charge/special-amount → { credit: 666, credit_desc: "...", credit_expire: ... }
   //
-  // 注意三点：
-  //  1. 单位：*_in_milli ÷ 1000 = credits；*_in_sec ÷ 3600 = 核时
-  //  2. volume 是扁平数字（已用量），quota 才是 {total,free} 对象
-  //  3. quota.total **已包含** special-amount 的加成，不能当"基础套餐额度"，
-  //     否则用户看到 1166 却不知道其中 666 是赠送的、何时过期。
-  const num = (v) => {
-    if (v == null) return null;
-    const n = typeof v === 'object' ? Number(v.total ?? NaN) : Number(v);
-    return Number.isFinite(n) ? n : null;
-  };
-
-  const round1 = (n) => Math.round(Number(n) * 10) / 10;
-
-  // 数值显示：整数不拖 .0，小数留一位，保证各账号格式统一
-  const num1 = (n) => {
-    const v = round1(n);
-    return Number.isInteger(v) ? String(v) : v.toFixed(1);
-  };
-  // 2026-10-31T15:59:59Z → 2026-10-31
-  const fmtDate = (s) => String(s || '').slice(0, 10);
-
-  // 加成那一段的文案。三种情况必须分开，否则会误导用户：
-  //   有加成未过期 → 「天才程序员专属特权 +666（2026-12-31 到期）」
-  //   有加成已过期 → 「天才程序员专属特权 +666 已过期」   ← 不能还写 "+666" 让人以为可用
-  //   没有加成     → 空字符串（不显示，别出现 "加成 +0" 这种噪音）
-  function bonusPart(amount, desc, expire, expired) {
-    if (amount == null) return '';
-    const label = desc || '赠送';
-    if (expired) return `${label} +${num1(amount)} 已过期`;
-    return expire ? `${label} +${num1(amount)} · 有效期至 ${fmtDate(expire)}` : `${label} +${num1(amount)}`;
-  }
-
-  // 加成本身可为 null / 0（没有特权的账号就是这样），要能区分「没有」和「不知道」
-  const positive = (v) => {
-    const n = Number(v);
-    return Number.isFinite(n) && n > 0 ? n : null;
-  };
-
-  // 从 {credit, credit_desc, credit_expire} 这类三元组里取出有效的那项。
-  // 注意：接口会返回**已过期**的加成（quota 里可能也已经扣掉了），
-  // 所以要带出 expired 标记，让显示层能说"已过期"而不是继续吹 "+666"。
+  // 三个接口的字段口径见文件上半部「数值与显示」：bucket() 负责配平
+  // （quota.total 已含特权，基础额度要减掉），specialOf() 负责把
+  // {key, key_desc, key_expire} 三元组解成"有没有过期"。
   //
-  // 注意字段名：值叫 compute_develop_corehour，
-  // 但说明和过期时间叫 compute_develop_desc / compute_develop_expire（**没有 _corehour**）。
-  // 不传 baseKey 时按 `${key}_desc` 拼，传了就优先用它。
-  function specialOf(special, key, unitScale, baseKey = null, now = Date.now()) {
-    if (!special) return null;
-    const amount = positive(special[key]);
-    if (amount == null) return null;
-    const stem = baseKey || key;
-    const desc = String(special[`${stem}_desc`] ?? '').trim();
-    const expireRaw = String(special[`${stem}_expire`] ?? '').trim();
-    // 9999 年那种「永不过期」当成没有期限
-    const expire = expireRaw && !/^9999/.test(expireRaw) ? expireRaw : null;
-    const expiresAt = expire ? Date.parse(expire) : null;
-    const expired = expiresAt != null && Number.isFinite(expiresAt) && expiresAt < now;
-    return {
-      amount: amount / unitScale,
-      desc: desc || null,
-      expire,
-      expired,
-    };
-  }
-
-  // 额度三元组（总额 / 已用 / 冻结 / 特权）的通用算法。
-  //
-  // credits 和核时的字段口径完全一致，只是一个以 milli 计、一个以秒计。
-  // 两段一模一样的算式以前是复制粘贴的，改一处忘一处就会让面板上两个
-  // 窗口的数字对不上，所以合成一个。
-  //
-  // scale = 1 个显示单位对应多少原始单位（credits 1000、核时 3600）。
-  // pre   = 特权注解（specialOf 的返回值），null 表示没有特权。
-  // 返回 null 表示总额没拿到，调用方就不显示这一项。
-  function bucket(total, used, frozen, pre, scale) {
-    if (total == null) return null;
-    // 关键：total 已经包含特权，基础额度必须减掉特权，否则 666 会被算两次
-    const specialRaw = pre?.amount != null ? pre.amount * scale : null;
-    const baseRaw = specialRaw != null ? total - specialRaw : total;
-    // 可用 = 总额 - 已用 - 冻结；明明超了也要显示 0，不能出现负数
-    const remainRaw = Math.max(0, total - (used || 0) - frozen);
-    return {
-      total: total / scale,
-      used: used != null ? used / scale : null,
-      frozen: frozen / scale,
-      bonus: pre?.amount ?? null,
-      base: baseRaw / scale,
-      remain: remainRaw / scale,
-      // 已用率 / 已用+冻结率，都基于总额（不是基础额度）算
-      usedPct: used != null ? (used / total) * 100 : null,
-      usedFrozenPct: total > 0 ? ((used || 0) + frozen) / total * 100 : null,
-      bonusDesc: pre?.desc ?? null,
-      bonusExpire: pre?.expire ?? null,
-      bonusExpired: pre?.expired ?? false,
-    };
-  }
-
   // timeoutMs 给调用方决定：界面钩子等不起 20 秒，后台巡检可以慢慢来。
   // 失败原因收集在 errors 里 —— 静默吞掉的话，面板上只会显示"查不到额度"，
   // 谁也看不出是缺权限、超时，还是组织填错了。
@@ -1051,7 +1087,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
 
   // 面板展示用的一层短缓存：额度面板可能被频繁读（打开面板、每次请求后
   // 刷新），没必要每次都打 3 个接口。10 秒内的重复读复用上次结果 ——
-  // 只影响展示，拉起前的闸门（quotaGate）不用它，那里的判断永远是现查的。
+  // 只影响展示，启动前的闸门（quotaGate）不用它，那里的判断永远是现查的。
   const usageQuotaCache = new Map();   // (令牌指纹, 组织) → { at, data }
   async function chargeForUsage(org) {
     // 键里必须带令牌指纹：同一个组织可能被不同人的令牌分别登录，
@@ -1064,21 +1100,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return data;
   }
 
-  const hostOf = (u) => { try { return new URL(u).host; } catch { return u || ''; } };
-
-  // 把工作区域名打码：860lo2zlkf-9001.cnb.run → 860l****-9001.cnb.run
-  // 保留前 4 位是为了"自己认得出是哪个"，保留端口和域名是为了"看得出是否正常"。
-  const maskHost = (host) => {
-    const h = String(host || '');
-    if (!h) return '';
-    // cnb.run 的子域形如 <12位随机>-<端口>.<域名>
-    const m = h.match(/^([^-]+)-(\d+\..+)$/);
-    // 端口与域名原样保留：看得出是不是 9001、是不是 cnb.run
-    if (m) return `${m[1].slice(0, 4)}****-${m[2]}`;
-    // 其他形态：保留前 4 后 4，中间打码
-    if (h.length <= 10) return h;
-    return `${h.slice(0, 4)}****${h.slice(-4)}`;
-  };
   // config 阶段还没有"当前账号"，所以取不到 cfg 时要退回插件级的默认值，
   // 否则 config 会直接抛错导致整个插件加载失败。
   const defaultCfg = opts(pluginOptions);
@@ -1366,7 +1387,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
 
   }
 
-  // ---------- 后台轮询 ----------
+  // ---------- 状态机 · 后台轮询 ----------
   // 任何钩子都可以启动轮询，并支持"立即踢一脚"，这样登录后不发消息
   // 也能拿到工作区状态。
   //
@@ -1394,6 +1415,11 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     }
     return state.readyPromise;
   }
+
+  // ---------- 登录流程：问答与账号写入 ----------
+  //
+  // 状态全部由"用户真正答过的问题"推进（宿主只交回这些答案），
+  // 插件自己不递归塞值 —— 那正是之前 repo 丢过、账号并过的根因。
 
   // 登录时选的结束标记，跟在组织列表末尾表示"不再加了"
   const ORGS_DONE = '__done__';
@@ -1498,239 +1524,240 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   // 动态提问：先选组织、再选仓库，全部用真实数据做成下拉。
   // 宿主调用时 this 不一定指向 methods 对象，所以抽成独立函数。
   async function askNext(inputs = {}) {
-  const token = String(inputs.token || '').trim();
+    const token = String(inputs.token || '').trim();
 
-  // 1) 令牌
-  if (!inputs.token) {
-    return {
-      type: 'password',
-      key: 'token',
-      message: 'CNB 访问令牌 · 在 CNB 头像 → 访问令牌 页面生成',
-      placeholder: '粘贴访问令牌',
-    };
-  }
-  if (/^sk-/.test(token)) {
-    return {
-      type: 'text',
-      key: 'token',
-      message: '该值以 sk- 开头，是 PROXY_KEY，不是 CNB 访问令牌 · 请重新填写令牌',
-      placeholder: '粘贴访问令牌',
-    };
-  }
-
-  // 2) 组织：一次登录可以连着加多个
-  //
-  // 一个令牌通常能访问好几个组织，而额度按组织算，每个组织都得有独立账号。
-  // 以前一次登录只能加一个，有几个组织就要重登几次、把令牌粘几次。
-  //
-  // 状态全部放在 inputs 里、由用户的回答推进：宿主只收集「真正弹出来过
-  // 的问题」的答案，插件自己递归塞进去的值会被丢掉（这正是之前 repo
-  // 丢过、账号合并过的根因）。所以这里不用递归，改用一串答案推进状态机：
-  //   inputs.orgs           逗号分隔的组织，末尾带 __done__ 表示不再加了
-  //   inputs['repo@' + org] 该组织选定的仓库
-  const picked = parseOrgAnswers(inputs.orgs);
-  if (!picked.list.length) {
-    const orgs = await listOrgsForLogin(token).catch(() => null);
-    if (!orgs || !orgs.length) {
-      // 查不到就退回手填，不让流程卡死
+    // 1) 令牌
+    if (!inputs.token) {
+      return {
+        type: 'password',
+        key: 'token',
+        message: 'CNB 访问令牌 · 在 CNB 头像 → 访问令牌 页面生成',
+        placeholder: '粘贴访问令牌',
+      };
+    }
+    if (/^sk-/.test(token)) {
       return {
         type: 'text',
+        key: 'token',
+        message: '该值以 sk- 开头，是 PROXY_KEY，不是 CNB 访问令牌 · 请重新填写令牌',
+        placeholder: '粘贴访问令牌',
+      };
+    }
+
+    // 2) 组织：一次登录可以连着加多个
+    //
+    // 一个令牌通常能访问好几个组织，而额度按组织算，每个组织都得有独立账号。
+    // 以前一次登录只能加一个，有几个组织就要重登几次、把令牌粘几次。
+    //
+    // 状态全部放在 inputs 里、由用户的回答推进：宿主只收集「真正弹出来过
+    // 的问题」的答案，插件自己递归塞进去的值会被丢掉（这正是之前 repo
+    // 丢过、账号合并过的根因）。所以这里不用递归，改用一串答案推进状态机：
+    //   inputs.orgs           逗号分隔的组织，末尾带 __done__ 表示不再加了
+    //   inputs['repo@' + org] 该组织选定的仓库
+    const picked = parseOrgAnswers(inputs.orgs);
+    if (!picked.list.length) {
+      const orgs = await listOrgsForLogin(token).catch(() => null);
+      if (!orgs || !orgs.length) {
+        // 查不到就退回手填，不让流程卡死
+        return {
+          type: 'text',
+          key: 'orgs',
+          message: '填写组织 · 未能自动获取组织列表，请手动填写 CNB 组织名',
+          placeholder: '组织名，例如 acme',
+        };
+      }
+      // 只有 1 个组织时不必再问「还要加吗」，答案里直接带上结束标记
+      const only = orgs.length === 1;
+      return {
+        type: 'select',
         key: 'orgs',
-        message: '填写组织 · 未能自动获取组织列表，请手动填写 CNB 组织名',
-        placeholder: '组织名，例如 acme',
-      };
-    }
-    // 只有 1 个组织时不必再问「还要加吗」，答案里直接带上结束标记
-    const only = orgs.length === 1;
-    return {
-      type: 'select',
-      key: 'orgs',
-      message: only
-        ? `选择组织 · 该令牌仅属于 ${orgs[0]}`
-        : `选择组织 · 该令牌可访问 ${orgs.length} 个组织，每个组织对应一个账号`,
-      options: orgs.slice(0, 40).map((o) => ({
-        label: o,
-        value: only ? `${o},${ORGS_DONE}` : o,
-        // 连加多个只是为了少贴几次令牌，不是必须。只加这一个、剩下的
-        // 以后再登一次照样行（同一份令牌重复贴而已），所以提示写清楚。
-        hint: only
-          ? '唯一可选'
-          : (seenOrgs.has(o)
-            ? '已有同组织账号 · 同组织同仓库将覆盖原账号'
-            : '可继续添加其他组织，也可仅添加该组织'),
-      })),
-    };
-  }
-
-  // 3) 仓库（必选，而且必须由用户自己点）
-  //
-  // 不能自动挑：同一个组织下可能有好几个仓库都跑着 cnb2api，日志里的
-  // PROXY_URI 只能说明"这个仓库跑过"，说明不了用户想用哪个 —— 自动选中
-  // 错了，地址、账号、巡检就全挂到别的仓库上去了。所以哪怕只有一个候选，
-  // 也照样列出来让用户确认。
-
-  // 上一轮选了下拉里最后那条「手动填写」→ 换成文本框。
-  // 候选是筛出来的（日志里得有 PROXY_URI），漏筛很正常（仓库刚建、
-  // 日志已滚掉），所以永远给用户留一条自己填的路。
-  const manualOrg = picked.list.find(
-    (o) => String(inputs[`repo@${o}`] || '').trim() === REPO_MANUAL,
-  );
-  if (manualOrg) {
-    return {
-      type: 'text',
-      key: `repo@${manualOrg}`,
-      message: `填写仓库 · ${manualOrg} 下运行 cnb2api 的仓库`,
-      placeholder: '仓库名，或 组织/仓库',
-    };
-  }
-
-  const needRepo = picked.list.find((o) => {
-    const v = normalizeRepo(inputs[`repo@${o}`]) || '';
-    return !v || v === REPO_MANUAL;
-  });
-  if (needRepo) {
-    const found = await listCnbReposForLogin(token, needRepo).catch(() => null);
-    if (!found) {
-      // 查询失败：手填，但不能留空
-      return {
-        type: 'text',
-        key: `repo@${needRepo}`,
-        message: `填写仓库 · 未能获取 ${needRepo} 的仓库列表`,
-        placeholder: '组织/仓库',
-      };
-    }
-    if (!found.length) {
-      // 组织里没查到，仍然要求填 —— 可能是刚建的仓库、或日志还没出现
-      return {
-        type: 'text',
-        key: `repo@${needRepo}`,
-        message: `填写仓库 · ${needRepo} 下未找到运行 cnb2api 的仓库`,
-        placeholder: '只填仓库名，组织取上一步所选',
-      };
-    }
-    return {
-      type: 'select',
-      key: `repo@${needRepo}`,
-      message: found.length === 1
-        ? `确认仓库 · ${needRepo} 下仅有 1 个运行 cnb2api 的仓库`
-        : `选择仓库 · ${needRepo} 下有 ${found.length} 个运行 cnb2api 的仓库`,
-      options: [
-        ...found.map((r) => ({
-          label: r.repo,
-          value: r.repo,
-          hint: r.running ? '运行中' : '已停止',
+        message: only
+          ? `选择组织 · 该令牌仅属于 ${orgs[0]}`
+          : `选择组织 · 该令牌可访问 ${orgs.length} 个组织，每个组织对应一个账号`,
+        options: orgs.slice(0, 40).map((o) => ({
+          label: o,
+          value: only ? `${o},${ORGS_DONE}` : o,
+          // 连加多个只是为了少贴几次令牌，不是必须。只加这一个、剩下的
+          // 以后再登一次照样行（同一份令牌重复贴而已），所以提示写清楚。
+          hint: only
+            ? '唯一可选'
+            : (seenOrgs.has(o)
+              ? '已有同组织账号 · 同组织同仓库将覆盖原账号'
+              : '可继续添加其他组织，也可仅添加该组织'),
         })),
-        {
-          label: '手动填写仓库名…',
-          value: REPO_MANUAL,
-          hint: '目标仓库不在列表中',
-        },
-      ],
-    };
-  }
+      };
+    }
 
-  // 4) PROXY_KEY
-  //
-  // 顺序：令牌 → 组织 → 仓库 → PROXY_KEY → 还要加别的组织吗。
-  //
-  // PROXY_KEY 跟着**仓库**走：它写在该仓库 `.cnb.yml` 的 env 里，属于那个
-  // 仓库的工作区。所以仓库一定就位之后再问它，而且是**一个仓库问一次** ——
-  // 两个仓库完全可能一个 sk-a 一个 sk-b，不能填一次套给所有账号。
-  //
-  // 这个**必须手填，没有任何"自动获取"的可能**：CNB 的 OpenAPI 读不到
-  // 工作区的 env（能读到就等于谁拿到令牌都能读别人的密钥）。
-  //
-  // 连续加几个仓库时，从第 2 个起不必再粘贴：先问「和上一个仓库相同 /
-  // 填一个不同的」，选相同就沿用（KEY_SAME），选不同才弹输入框。
-  const targets = targetsOf(inputs);
-  if (targets.length) {
-    const keys = keyMapOf(inputs, targets);
-    const pending = targets.find((t) => !keys.has(t.repo));
-    if (pending) {
-      const prevRepo = [...keys.keys()].slice(-1)[0] || '';
-      // 只有一个仓库时保持 inputs.proxyKey（静态 prompts 那条路也用它）
-      const keyName = targets.length === 1 ? 'proxyKey' : `proxyKey@${pending.repo}`;
-      const wanted = String(inputs[keyName] ?? '').trim();
+    // 3) 仓库（必选，而且必须由用户自己点）
+    //
+    // 不能自动挑：同一个组织下可能有好几个仓库都跑着 cnb2api，日志里的
+    // PROXY_URI 只能说明"这个仓库跑过"，说明不了用户想用哪个 —— 自动选中
+    // 错了，地址、账号、巡检就全挂到别的仓库上去了。所以哪怕只有一个候选，
+    // 也照样列出来让用户确认。
 
-      if (!prevRepo || targets.length === 1) {
+    // 上一轮选了下拉里最后那条「手动填写」→ 换成文本框。
+    // 候选是筛出来的（日志里得有 PROXY_URI），漏筛很正常（仓库刚建、
+    // 日志已滚掉），所以永远给用户留一条自己填的路。
+    const manualOrg = picked.list.find(
+      (o) => String(inputs[`repo@${o}`] || '').trim() === REPO_MANUAL,
+    );
+    if (manualOrg) {
+      return {
+        type: 'text',
+        key: `repo@${manualOrg}`,
+        message: `填写仓库 · ${manualOrg} 下运行 cnb2api 的仓库`,
+        placeholder: '仓库名，或 组织/仓库',
+      };
+    }
+
+    const needRepo = picked.list.find((o) => {
+      const v = normalizeRepo(inputs[`repo@${o}`]) || '';
+      return !v || v === REPO_MANUAL;
+    });
+    if (needRepo) {
+      const found = await listCnbReposForLogin(token, needRepo).catch(() => null);
+      if (!found) {
+        // 查询失败：手填，但不能留空
+        return {
+          type: 'text',
+          key: `repo@${needRepo}`,
+          message: `填写仓库 · 未能获取 ${needRepo} 的仓库列表`,
+          placeholder: '组织/仓库',
+        };
+      }
+      if (!found.length) {
+        // 组织里没查到，仍然要求填 —— 可能是刚建的仓库、或日志还没出现
+        return {
+          type: 'text',
+          key: `repo@${needRepo}`,
+          message: `填写仓库 · ${needRepo} 下未找到运行 cnb2api 的仓库`,
+          placeholder: '只填仓库名，组织取上一步所选',
+        };
+      }
+      return {
+        type: 'select',
+        key: `repo@${needRepo}`,
+        message: found.length === 1
+          ? `确认仓库 · ${needRepo} 下仅有 1 个运行 cnb2api 的仓库`
+          : `选择仓库 · ${needRepo} 下有 ${found.length} 个运行 cnb2api 的仓库`,
+        options: [
+          ...found.map((r) => ({
+            label: r.repo,
+            value: r.repo,
+            hint: r.running ? '运行中' : '已停止',
+          })),
+          {
+            label: '手动填写仓库名…',
+            value: REPO_MANUAL,
+            hint: '目标仓库不在列表中',
+          },
+        ],
+      };
+    }
+
+    // 4) PROXY_KEY
+    //
+    // 顺序：令牌 → 组织 → 仓库 → PROXY_KEY → 还要加别的组织吗。
+    //
+    // PROXY_KEY 跟着**仓库**走：它写在该仓库 `.cnb.yml` 的 env 里，属于那个
+    // 仓库的工作区。所以仓库一定就位之后再问它，而且是**一个仓库问一次** ——
+    // 两个仓库完全可能一个 sk-a 一个 sk-b，不能填一次套给所有账号。
+    //
+    // 这个**必须手填，没有任何"自动获取"的可能**：CNB 的 OpenAPI 读不到
+    // 工作区的 env（能读到就等于谁拿到令牌都能读别人的密钥）。
+    //
+    // 连续加几个仓库时，从第 2 个起不必再粘贴：先问「和上一个仓库相同 /
+    // 填一个不同的」，选相同就沿用（KEY_SAME），选不同才弹输入框。
+    const targets = targetsOf(inputs);
+    if (targets.length) {
+      const keys = keyMapOf(inputs, targets);
+      const pending = targets.find((t) => !keys.has(t.repo));
+      if (pending) {
+        const prevRepo = [...keys.keys()].slice(-1)[0] || '';
+        // 只有一个仓库时保持 inputs.proxyKey（静态 prompts 那条路也用它）
+        const keyName = targets.length === 1 ? 'proxyKey' : `proxyKey@${pending.repo}`;
+        const wanted = String(inputs[keyName] ?? '').trim();
+
+        if (!prevRepo || targets.length === 1) {
+          return {
+            type: 'password',
+            key: keyName,
+            message: `${targets.length === 1 ? 'PROXY_KEY' : `${pending.repo} 的 PROXY_KEY`}`
+              + ' · 取自该仓库 .cnb.yml 的 env',
+            placeholder: 'sk-…',
+          };
+        }
+        if (wanted !== KEY_OTHER) {
+          return {
+            type: 'select',
+            key: keyName,
+            message: `${pending.repo} 的 PROXY_KEY · 每个仓库各配置一份`,
+            options: [
+              {
+                label: '与上一个仓库相同',
+                value: KEY_SAME,
+                hint: `沿用 ${prevRepo} 的值`,
+              },
+              {
+                label: '填写其他值',
+                value: KEY_OTHER,
+                hint: '该仓库 .cnb.yml 中是另一个值',
+              },
+            ],
+          };
+        }
         return {
           type: 'password',
           key: keyName,
-          message: `${targets.length === 1 ? 'PROXY_KEY' : `${pending.repo} 的 PROXY_KEY`}`
-            + ' · 取自该仓库 .cnb.yml 的 env',
+          message: `${pending.repo} 的 PROXY_KEY · 取自该仓库 .cnb.yml 的 env`,
           placeholder: 'sk-…',
         };
       }
-      if (wanted !== KEY_OTHER) {
-        return {
-          type: 'select',
-          key: keyName,
-          message: `${pending.repo} 的 PROXY_KEY · 每个仓库各配置一份`,
-          options: [
-            {
-              label: '与上一个仓库相同',
-              value: KEY_SAME,
-              hint: `沿用 ${prevRepo} 的值`,
-            },
-            {
-              label: '填写其他值',
-              value: KEY_OTHER,
-              hint: '该仓库 .cnb.yml 中是另一个值',
-            },
-          ],
-        };
+    }
+
+    // 5) 还要加别的组织吗
+    //
+    // 已经配好仓库的组织在提示里列出来，让用户看得见「现在要加的是哪几个」。
+    // 答案仍然写回 orgs，末尾补上 __done__ 就表示收工 —— 这是最后一步，
+    // 答「就这些」登录立刻完成。
+    if (!picked.done) {
+      const all = (await listOrgsForLogin(token).catch(() => null)) || [];
+      const rest = all.filter((o) => !picked.list.includes(o));
+      const full = picked.list.map((o) => {
+        const r = normalizeRepo(inputs[`repo@${o}`]) || '';
+        return r.includes('/') ? r : `${o}/${r}`;
+      });
+      const options = [{
+        label: picked.list.length === 1
+          ? '完成登录 · 仅添加这 1 个'
+          : '完成登录',
+        value: `${picked.list.join(',')},${ORGS_DONE}`,
+        hint: `将添加 ${picked.list.length} 个账号：${full.join('、')}`,
+      }];
+      for (const o of rest.slice(0, 20)) {
+        options.push({
+          label: `添加组织：${o}`,
+          value: `${picked.list.join(',')},${o}`,
+          hint: seenOrgs.has(o)
+            ? '已有该组织的账号 · 本次添加同组织下的另一仓库'
+            : `继续选择 ${o} 下的仓库`,
+        });
       }
       return {
-        type: 'password',
-        key: keyName,
-        message: `${pending.repo} 的 PROXY_KEY · 取自该仓库 .cnb.yml 的 env`,
-        placeholder: 'sk-…',
+        type: 'select',
+        key: 'orgs',
+        message: rest.length
+          ? '添加其他组织 · 选择「完成登录」即保存，不再询问令牌与 PROXY_KEY'
+          : '组织配置完成 · 确认以结束登录',
+        options,
       };
     }
+
+    return null;
   }
 
-  // 5) 还要加别的组织吗
-  //
-  // 已经配好仓库的组织在提示里列出来，让用户看得见「现在要加的是哪几个」。
-  // 答案仍然写回 orgs，末尾补上 __done__ 就表示收工 —— 这是最后一步，
-  // 答「就这些」登录立刻完成。
-  if (!picked.done) {
-    const all = (await listOrgsForLogin(token).catch(() => null)) || [];
-    const rest = all.filter((o) => !picked.list.includes(o));
-    const full = picked.list.map((o) => {
-      const r = normalizeRepo(inputs[`repo@${o}`]) || '';
-      return r.includes('/') ? r : `${o}/${r}`;
-    });
-    const options = [{
-      label: picked.list.length === 1
-        ? '完成登录 · 仅添加这 1 个'
-        : '完成登录',
-      value: `${picked.list.join(',')},${ORGS_DONE}`,
-      hint: `将添加 ${picked.list.length} 个账号：${full.join('、')}`,
-    }];
-    for (const o of rest.slice(0, 20)) {
-      options.push({
-        label: `添加组织：${o}`,
-        value: `${picked.list.join(',')},${o}`,
-        hint: seenOrgs.has(o)
-          ? '已有该组织的账号 · 本次添加同组织下的另一仓库'
-          : `继续选择 ${o} 下的仓库`,
-      });
-    }
-    return {
-      type: 'select',
-      key: 'orgs',
-      message: rest.length
-        ? '添加其他组织 · 选择「完成登录」即保存，不再询问令牌与 PROXY_KEY'
-        : '组织配置完成 · 确认以结束登录',
-      options,
-    };
-  }
-
-  return null;
-
-  }
-
+  // ---------- 宿主协议 ----------
+  // 以下四个入口由 magpie 调用：config / auth（含 loader）/ usage / tool。
   return {
     config: async (c) => {
       // 插件加载时还没有"当前账号"（config 不在账号作用域里），
@@ -1761,7 +1788,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
 
       // 两类完全不同的凭据，分两个输入框，很容易填反：
       //
-      //   CNB 访问令牌  → 调 CNB OpenAPI（查工作区、读日志、拉起工作区）
+      //   CNB 访问令牌  → 调 CNB OpenAPI（查工作区、读日志、启动工作区）
       //                   由 CNB 校验，形如 nkXXXXXXXX
       //   PROXY_KEY     → 调那个仓库工作区里的 cnb2api 网关（每个仓库一份）
       //                   由 `.cnb.yml` 里的环境变量校验，通常形如 sk-xxx
@@ -1981,7 +2008,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             if (!state.uri) {
               await refresh('no-uri');
               if (!state.uri && !state.fatal && !(await waitForReady(60_000))) {
-                // 额度用尽是"不必拉起"，不是"没起来"，别让人去查工作区
+                // 额度用尽是"不必启动"，不是"没起来"，别让人去查工作区
                 if (state.quotaBlocked) {
                   return oaiError(503, state.quotaBlocked.message,
                     '额度补足后工作区将自动启动 · 也可再次调用 cnb2api_workspace_start');
@@ -2053,7 +2080,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               if (!state.recoveringPromise) {
                 state.recoveringPromise = (async () => {
                   await refresh('request-failed').catch(() => {});
-                  // 检测到停止或被拉起过 -> 值得等一会儿；否则只试一次
+                  // 检测到停止或被启动过 -> 值得等一会儿；否则只试一次
                   if (!state.uri || state.recovering) await waitForReady(120_000);
                 })().finally(() => { state.recoveringPromise = null; });
               }
@@ -2091,131 +2118,131 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         const ctx = ctxFor(auth);
         if (!ctx.label) ctx.label = labelOf(auth, ctx);
         return within(ctx, async () => {
-        // 必须先把凭据读进 cfg —— usage 可能先于 loader 被调用（比如刚登录、
-        // 或只在界面上看额度而不发消息），缺少这步 cfg.token 就是空的。
-        applyCredentials(auth);
+          // 必须先把凭据读进 cfg —— usage 可能先于 loader 被调用（比如刚登录、
+          // 或只在界面上看额度而不发消息），缺少这步 cfg.token 就是空的。
+          applyCredentials(auth);
 
-        // 账号名。与日志前缀共用一套规则（labelOf），不在这里重算一遍：
-        // 这个名字同时是 magpie 的持久化键，两处实现一旦分叉就会多出一批孤儿键。
-        // 不返回 user 的话宿主要拿 key 尾缀当名字（"API key …-key"）。
-        const accountName = labelOf(auth, ctx);
-        // usage 是界面钩子，**宿主等不起冷启动**：工作区停着时调 start 要
-        // 1~10 秒，探一个不通的地址要好几秒 —— 一旦在这里同步等，额度面板
-        // 就是一片空白，用户看到的就是"无法获取额度"。
-        //
-        // 所以这里只读现成状态，外加一个很短的首屏等待；真正推进状态的事
-        // （识别地址、拉起工作区）交给后台定时器，不阻塞这次返回。
-        ensureTimer();
-        if (!state.uri) {
-          // 首轮识别（列工作区 + 读日志）通常 0.2~1 秒，给它一点时间；
-          // 但绝不等到 /workspace/start 返回 —— 是否要拉起由后台决定。
-          await waitForUri(1200);
-        } else if (Date.now() - state.lastCheck > 15_000) {
-          refreshInBackground('usage');
-        }
-
-        const out = {
-          plan: state.status === 'running' ? 'running' : (state.status || 'unknown'),
-          // 账号名用 CNB 用户名，多账号才能分清谁是谁
-          ...(accountName ? { user: accountName } : {}),
-        };
-
-        // 1) 工作区/地址状态
-        // 这一行回答"这个账号现在能不能用"。地址是 API 端点，默认打码，
-        // 因为额度面板常被截图分享。
-        //
-        // 只对"正在运行"的工作区探活：工作区已停止时那个地址必然连不上，
-        // 探它只会白等满超时。1.5 秒够判定"地址通了没"（通的时候通常 <200ms）。
-        const running = state.status === 'running';
-        const alive = state.uri && running ? await health(state.uri, 1500) : false;
-        const host = state.uri ? hostOf(state.uri) : '';
-        out.windows = [{
-          name: 'workspace',
-          // aside：用掉它不影响账号本身可用（文档语义）
-          aside: true,
-          display: alive
-            ? `ok · ${maskHost(host)}`
-            : `不可用 · ${!state.uri
-              ? (state.lastError
-                || (state.status === 'none' ? '该仓库尚无工作区' : '正在识别工作区'))
-              : (running ? (state.lastError || '地址未响应') : '工作区已停止')}`,
-        }];
-
-        // 想看完整地址时设这个环境变量（分享截图前记得关掉）
-        if (process.env.CNB2API_SHOW_FULL_HOST === '1' && alive) {
-          out.windows[0].display = `ok · ${host}`;
-        }
-
-        // 1b) 自动重启状态：权限不够时明确告诉用户"能跟随但不会重启"
-        if (cfg.autoStart && state.status !== 'running' && state.autoStartBlocked) {
-          out.windows.push({
-            name: 'auto-restart',
-            aside: true,
-            display: '已关闭 · 缺少 repo-cnb-trigger:rw',
-          });
-        }
-
-        // 2) CNB 真实额度（需要 account-engage:r / group-resource:r）
-        //
-        // 查不到时**必须说明原因**，否则面板上就是一片空白，用户只能看到
-        // "没有额度"却不知道是缺权限、超时，还是组织不对。额度窗口用
-        // text:true（纯文本，不画进度条），aside:true（查不到不代表账号不可用）。
-        const org = String(cfg.repo || '').split('/')[0];
-        const quotaUnavailable = (why) => {
-          out.windows.push({ name: 'AI credits', aside: true, text: true, display: why });
-        };
-        // 进度条窗口：credits 与核时的字段完全一致，只有名字与单位不同
-        const progressWindow = (name, unit, d) => ({
-          name,
-          // used 是**百分比 0-100**，不是已用量。它同时是进度条的开关：
-          // 不给这个字段，宿主认为窗口"没有读数"，只渲染文字不画进度条。
-          used: d.usedPct != null ? Math.min(100, Math.max(0, round1(d.usedPct))) : 0,
-          // amount/limit/unit：进度条上的数字（已用/总额 + 单位）
-          amount: round1(d.used ?? 0),
-          limit: round1(d.total),
-          unit,
-          // 文字只补进度条看不出来的：特权 · 冻结 · 可用
-          display: [
-            bonusPart(d.bonus, d.bonusDesc, d.bonusExpire, d.bonusExpired),
-            `冻结 ${num1(d.frozen)}`,
-            `可用 ${num1(d.remain)}`,
-          ].filter(Boolean).join(' · '),
-        });
-        if (!org || !cfg.token) {
-          quotaUnavailable(!cfg.token ? '查不到 · 尚未读取到 CNB 访问令牌' : '查不到 · 仓库未确定');
-        } else {
-          try {
-            // 界面钩子等不起：4 秒拿不到就照实报"超时"，不拖住整个面板
-            const q = await chargeForUsage(org);
-            if (q?.credit && q.credit.used != null) {
-              out.windows.push(progressWindow('AI credits', 'cr', q.credit));
-            } else if (q?.credit) {
-              // 总额拿到了、已用量没拿到（volume 单独失败）：能显示就别空着
-              const c = q.credit;
-              out.windows.push({
-                name: 'AI credits',
-                aside: true,
-                text: true,
-                display: `可用 ${num1(c.remain)} / ${num1(c.total)} cr · 已用量未取到`
-                  + (q.errors?.length ? `（${q.errors[0]}）` : ''),
-              });
-            } else {
-              quotaUnavailable(`查不到 · ${q?.errors?.[0] || '令牌可能缺少 group-resource:r'}`);
-            }
-            if (q?.devHours && q.devHours.used != null) {
-              out.windows.push(progressWindow('dev core-hours', 'h', q.devHours));
-            }
-          } catch (e) {
-            out.error = `额度查询失败 · ${e.message}`;
-            quotaUnavailable(`查不到 · ${e.message}`);
+          // 账号名。与日志前缀共用一套规则（labelOf），不在这里重算一遍：
+          // 这个名字同时是 magpie 的持久化键，两处实现一旦分叉就会多出一批孤儿键。
+          // 不返回 user 的话宿主要拿 key 尾缀当名字（"API key …-key"）。
+          const accountName = labelOf(auth, ctx);
+          // usage 是界面钩子，**宿主等不起冷启动**：工作区停着时调 start 要
+          // 1~10 秒，探一个不通的地址要好几秒 —— 一旦在这里同步等，额度面板
+          // 就是一片空白，用户看到的就是"无法获取额度"。
+          //
+          // 所以这里只读现成状态，外加一个很短的首屏等待；真正推进状态的事
+          // （识别地址、启动工作区）交给后台定时器，不阻塞这次返回。
+          ensureTimer();
+          if (!state.uri) {
+            // 首轮识别（列工作区 + 读日志）通常 0.2~1 秒，给它一点时间；
+            // 但绝不等到 /workspace/start 返回 —— 是否要启动由后台决定。
+            await waitForUri(1200);
+          } else if (Date.now() - state.lastCheck > 15_000) {
+            refreshInBackground('usage');
           }
-        }
-        return out;
+
+          const out = {
+            plan: state.status === 'running' ? 'running' : (state.status || 'unknown'),
+            // 账号名用 CNB 用户名，多账号才能分清谁是谁
+            ...(accountName ? { user: accountName } : {}),
+          };
+
+          // 1) 工作区/地址状态
+          // 这一行回答"这个账号现在能不能用"。地址是 API 端点，默认打码，
+          // 因为额度面板常被截图分享。
+          //
+          // 只对"正在运行"的工作区探活：工作区已停止时那个地址必然连不上，
+          // 探它只会白等满超时。1.5 秒够判定"地址通了没"（通的时候通常 <200ms）。
+          const running = state.status === 'running';
+          const alive = state.uri && running ? await health(state.uri, 1500) : false;
+          const host = state.uri ? hostOf(state.uri) : '';
+          out.windows = [{
+            name: 'workspace',
+            // aside：用掉它不影响账号本身可用（文档语义）
+            aside: true,
+            display: alive
+              ? `ok · ${maskHost(host)}`
+              : `不可用 · ${!state.uri
+                ? (state.lastError
+                  || (state.status === 'none' ? '该仓库尚无工作区' : '正在识别工作区'))
+                : (running ? (state.lastError || '地址未响应') : '工作区已停止')}`,
+          }];
+
+          // 想看完整地址时设这个环境变量（分享截图前记得关掉）
+          if (process.env.CNB2API_SHOW_FULL_HOST === '1' && alive) {
+            out.windows[0].display = `ok · ${host}`;
+          }
+
+          // 1b) 自动重启状态：权限不够时明确告诉用户"能跟随但不会重启"
+          if (cfg.autoStart && state.status !== 'running' && state.autoStartBlocked) {
+            out.windows.push({
+              name: 'auto-restart',
+              aside: true,
+              display: '已关闭 · 缺少 repo-cnb-trigger:rw',
+            });
+          }
+
+          // 2) CNB 真实额度（需要 account-engage:r / group-resource:r）
+          //
+          // 查不到时**必须说明原因**，否则面板上就是一片空白，用户只能看到
+          // "没有额度"却不知道是缺权限、超时，还是组织不对。额度窗口用
+          // text:true（纯文本，不画进度条），aside:true（查不到不代表账号不可用）。
+          const org = String(cfg.repo || '').split('/')[0];
+          const quotaUnavailable = (why) => {
+            out.windows.push({ name: 'AI credits', aside: true, text: true, display: why });
+          };
+          // 进度条窗口：credits 与核时的字段完全一致，只有名字与单位不同
+          const progressWindow = (name, unit, d) => ({
+            name,
+            // used 是**百分比 0-100**，不是已用量。它同时是进度条的开关：
+            // 不给这个字段，宿主认为窗口"没有读数"，只渲染文字不画进度条。
+            used: d.usedPct != null ? Math.min(100, Math.max(0, round1(d.usedPct))) : 0,
+            // amount/limit/unit：进度条上的数字（已用/总额 + 单位）
+            amount: round1(d.used ?? 0),
+            limit: round1(d.total),
+            unit,
+            // 文字只补进度条看不出来的：特权 · 冻结 · 可用
+            display: [
+              bonusPart(d.bonus, d.bonusDesc, d.bonusExpire, d.bonusExpired),
+              `冻结 ${num1(d.frozen)}`,
+              `可用 ${num1(d.remain)}`,
+            ].filter(Boolean).join(' · '),
+          });
+          if (!org || !cfg.token) {
+            quotaUnavailable(!cfg.token ? '查不到 · 尚未读取到 CNB 访问令牌' : '查不到 · 仓库未确定');
+          } else {
+            try {
+              // 界面钩子等不起：4 秒拿不到就照实报"超时"，不拖住整个面板
+              const q = await chargeForUsage(org);
+              if (q?.credit && q.credit.used != null) {
+                out.windows.push(progressWindow('AI credits', 'cr', q.credit));
+              } else if (q?.credit) {
+                // 总额拿到了、已用量没拿到（volume 单独失败）：能显示就别空着
+                const c = q.credit;
+                out.windows.push({
+                  name: 'AI credits',
+                  aside: true,
+                  text: true,
+                  display: `可用 ${num1(c.remain)} / ${num1(c.total)} cr · 已用量未取到`
+                    + (q.errors?.length ? `（${q.errors[0]}）` : ''),
+                });
+              } else {
+                quotaUnavailable(`查不到 · ${q?.errors?.[0] || '令牌可能缺少 group-resource:r'}`);
+              }
+              if (q?.devHours && q.devHours.used != null) {
+                out.windows.push(progressWindow('dev core-hours', 'h', q.devHours));
+              }
+            } catch (e) {
+              out.error = `额度查询失败 · ${e.message}`;
+              quotaUnavailable(`查不到 · ${e.message}`);
+            }
+          }
+          return out;
         });
       },
     },
 
-    // ---- 工具：查看 / 拉起工作区、查额度 ----
+    // ---- 工具：查看状态、启动工作区、查额度 ----
     // tool 会暴露到 magpie 的 plugin-tools MCP server 上，agent 可直接调用。
     //
     // 宿主的 runTool 不注入账号作用域，所以要自己遍历 ctxs 跑每个账号。
@@ -2247,7 +2274,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             if (state.status === 'running' && state.uri) {
               return [`已在运行 · ${maskHost(hostOf(state.uri))}`];
             }
-            // 显式拉起：额度现查一次，别被一分钟前的旧结论挡住
+            // 显式启动：额度现查一次，别被一分钟前的旧结论挡住
             const started = await startWorkspace(true);
             if (!started) {
               // 拦下来的原因（额度用尽 / 缺权限 / 接口报错）已经写在 lastError 里
@@ -2311,4 +2338,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
 export const _internal = {
   pickUri, pickUriFromLog, strip, materialize, opts, normalizeRepo,
   PERMISSIONS, explainScope, scopeReport,
+  // 纯函数层：额度配平、数值格式、地址打码
+  bucket, specialOf, bonusPart, num1, maskHost, tsOf,
 };
