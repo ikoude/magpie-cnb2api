@@ -641,18 +641,41 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return m;
   }
 
+  // 工作区列表。**不要给服务端传 slug**：它的 slug 过滤会漏记录。
+  //
+  // 实测（2026-11-20）：ikelaode/cnb2api 在平台上共 5 条记录
+  // （1 running + 4 closed），但 `?slug=ikelaode/cnb2api` 只回 1 条 —— 那 4 条
+  // 的 repo_url 指向 qdirs，服务端把它们当成"不属于这个 slug"滤掉了。
+  // 后果很直接：该组织没有 running 实例时列表就是空的，插件据此判"从没建过"，
+  // 面板上显示"未建"，而实际上这些实例一直在，只是全处于 stopped。
+  //
+  // 所以拉全量（不带 slug）自己按仓库筛。列表是"我名下所有工作区"，
+  // 权限与原来探测用的 /workspace/list 一致；页大小取 100，够快也够全。
   async function listWorkspaces() {
-    const q = new URLSearchParams({ page: '1', page_size: '50' });
-    // 不传 slug = 列出「我」名下所有工作区。用来自动发现仓库，
-    // 因为别人的仓库不一定叫 cnb2api。
-    if (cfg.repo) q.set('slug', cfg.repo);
-    const res = await api(`/workspace/list?${q}`);
-    const j = await res.json();
-    const list = j.list || j.data || [];
-    // 服务端理论上按 slug 过滤了，但本地再筛一遍：
-    // 宁可多这一步，也不能误用别的仓库的工作区（会去读错日志、甚至启动错仓库）
-    if (!cfg.repo) return list;
-    return list.filter((w) => (w.slug || w.repo_url) === cfg.repo);
+    const all = [];
+    for (let page = 1; page <= 5; page++) {
+      const q = new URLSearchParams({ page: String(page), page_size: '100' });
+      const res = await api(`/workspace/list?${q}`);
+      const j = await res.json();
+      const list = j.list || j.data || [];
+      all.push(...list);
+      if (!j.hasMore || !list.length) break;
+    }
+    // 本地筛一遍：宁可多这一步，也不能误用别的仓库的工作区
+    // （会去读错日志、甚至启动错仓库）
+    if (!cfg.repo) return all;
+    return all.filter((w) => repoOfWorkspace(w) === cfg.repo);
+  }
+
+  // 工作区记录归属哪个仓库：slug 优先，缺了才退回 repo_url。
+  // repo_url 是完整地址（https://cnb.cool/org/repo），要剥掉协议与 .git。
+  function repoOfWorkspace(w) {
+    const slug = String(w.slug || '').replace(/^\/+|\/+$/g, '');
+    if (slug) return slug;
+    return String(w.repo_url || '')
+      .replace(/^https?:\/\/[^/]+\//, '')
+      .replace(/\.git$/, '')
+      .replace(/\/+$/, '');
   }
 
 

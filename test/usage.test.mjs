@@ -14,6 +14,8 @@ const world = {
   empty: false,
   // 首屏识别慢于 usage 的 1200ms 预算：此时面板只能给出默认文案
   listDelayMs: 0,
+  // 最后一次工作区列表请求，用来确认没把筛选交给服务端
+  listQuery: '',
 };
 
 globalThis.fetch = async (u0, init = {}) => {
@@ -32,8 +34,16 @@ globalThis.fetch = async (u0, init = {}) => {
   if (p.startsWith('/user')) return json({ username: 'alice' });
   if (p.startsWith('/workspace/list')) {
     if (world.listDelayMs) await sleep(world.listDelayMs);
+    world.listQuery = p;
     if (world.empty) return json({ list: [] });
-    return json({ list: [{ slug: 'acme/gateway', sn: 'sn-1', status: world.status, create_time: '2026-11-18T10:00:00Z' }] });
+    return json({
+      hasMore: false,
+      list: [
+        { slug: 'acme/gateway', sn: 'sn-1', status: world.status, create_time: '2026-11-18T10:00:00Z' },
+        // 别的仓库的工作区也在这份"我名下所有工作区"里，必须由插件自己筛掉
+        { slug: 'other/repo', sn: 'sn-x', status: 'running', create_time: '2026-11-20T10:00:00Z' },
+      ],
+    });
   }
   if (m === 'POST' && p.includes('/-/workspace/start')) {
     world.starts++;
@@ -192,6 +202,19 @@ console.log('\n[9] 仓库里没有工作区：徽标"未建"，不是英文 none
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
   ok(ws?.display === '无工作区', `workspace 行同样说无工作区，实际 ${ws?.display}`);
   world.empty = false;
+}
+
+console.log('\n[10] 列表不带 slug：服务端的 slug 过滤会漏掉已停止的实例');
+{
+  // 实测 ?slug=ikelaode/cnb2api 只回 1 条，而平台上该仓库有 5 条 ——
+  // 漏掉的都是 closed 实例，插件于是误判"从未建过"，面板显示"未建"。
+  world.status = 'closed'; world.empty = false; world.chargeStatus = 200; world.listQuery = '';
+  const { plugin, auth } = await boot();
+  const out = await plugin.auth.usage(async () => auth);
+  ok(!/[?&]slug=/.test(world.listQuery), `列表不带 slug，实际 ${world.listQuery}`);
+  const ws = (out.windows || []).find((w) => w.name === 'workspace');
+  ok(ws?.display === '已停止', `别的仓库的 running 不冒充本仓库，实际 ${ws?.display}`);
+  ok(out.plan === '停止', `徽标跟着本仓库走，实际 ${out.plan}`);
 }
 
 summary();
