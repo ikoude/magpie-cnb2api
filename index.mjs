@@ -2246,17 +2246,22 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             amount: round1(d.used ?? 0),
             limit: round1(d.total),
             unit,
-            // 文字要能独立读懂：面板与 TTY 只渲染百分比 + 这段文字，
-            // amount/limit 不进文本，光有 "100%" 看不出到底多少额度。
-            // 所以这里自带 "已用 x / y 单位"；余额为 0 时它等价于 "已用尽"，不再重复写。
+            // 文字只补进度条/环比表达不出的：结论 · 特权 · 冻结 · 可用。
+            // 绝对数字在下面那条纯文字窗口里（detailWindow），两边不重复。
             display: [
-              dead
-                ? `已用尽 · ${num1(d.used)} / ${num1(d.total)} ${unit}`
-                : `已用 ${num1(d.used)} / ${num1(d.total)} ${unit}`,
+              dead ? '已用尽' : null,
               bonusPart(d.bonus, d.bonusDesc, d.bonusExpire, d.bonusExpired),
               `冻结 ${num1(d.frozen)}`,
               `可用 ${num1(d.remain)}`,
             ].filter(Boolean).join(' · '),
+          });
+          // 面板的账号卡片只画百分比环，amount/limit 不进任何文本，只有悬停提示里才有。
+          // 想直接读到数字，就得再给一条**纯文字**窗口：不给 used，宿主才不会当进度画。
+          // 卡片底部会把纯文字窗口原样排成一行，于是能读到 "AI credits 明细 已用 1166 / 1166 cr"。
+          const detailWindow = (name, unit, d) => ({
+            name: `${name} 明细`,
+            text: true,
+            display: `已用 ${num1(d.used)} / ${num1(d.total)} ${unit}`,
           });
           if (!org || !cfg.token) {
             quotaUnavailable(!cfg.token ? '查不到 · 尚未读取到 CNB 访问令牌' : '查不到 · 仓库未确定');
@@ -2270,6 +2275,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               creditDead = q?.credit?.remain != null && q.credit.remain <= 0;
               if (q?.credit && q.credit.used != null) {
                 out.windows.push(progressWindow('AI credits', 'cr', q.credit, creditDead));
+                out.windows.push(detailWindow('AI credits', 'cr', q.credit));
               } else if (q?.credit) {
                 // 总额拿到了、已用量没拿到（volume 单独失败）：能显示就别空着
                 const c = q.credit;
@@ -2286,6 +2292,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               }
               if (q?.devHours && q.devHours.used != null) {
                 out.windows.push(progressWindow('dev core-hours', 'h', q.devHours));
+                out.windows.push(detailWindow('dev core-hours', 'h', q.devHours));
               }
             } catch (e) {
               out.error = `额度查询失败 · ${e.message}`;

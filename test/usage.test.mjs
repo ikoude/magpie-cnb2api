@@ -98,8 +98,10 @@ console.log('\n[3] 额度正常时仍然照常显示');
   const credit = (out.windows || []).find((w) => w.name === 'AI credits');
   ok(credit?.amount === 300 && credit?.limit === 1166, `已用 300 / 1166，实际 ${credit?.amount}/${credit?.limit}`);
   ok(/可用 866/.test(credit?.display || ''), `可用 866，实际 ${credit?.display}`);
-  ok(/^已用 300 \/ 1166 cr/.test(credit?.display || ''),
-    `文字自带具体用量，光看百分比看不出多少，实际 ${credit?.display}`);
+  const det = (out.windows || []).find((w) => w.name === 'AI credits 明细');
+  ok(det?.text === true, '明细是一条纯文字窗口（面板才肯原样显示）');
+  ok(det?.display === '已用 300 / 1166 cr', `明细写明已用/总额，实际 ${det?.display}`);
+  ok(!/已用 300/.test(credit?.display || ''), '进度行不再重复数字');
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
   ok(/^就绪 · /.test(ws?.display || ''), `可用时写就绪，实际 ${ws?.display}`);
 }
@@ -150,8 +152,9 @@ console.log('\n[7] 额度打满且工作区已停：说明不会自动启动');
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
   ok(ws?.display === '已停止', `只给状态词，实际 ${ws?.display}`);
   const credit2 = (out.windows || []).find((w) => w.name === 'AI credits');
-  ok(/^已用尽 · 1166 \/ 1166 cr/.test(credit2?.display || ''),
-    `已用尽 + 具体用量，实际 ${credit2?.display}`);
+  ok(/^已用尽 · /.test(credit2?.display || ''), `额度行点明已用尽，实际 ${credit2?.display}`);
+  const det2 = (out.windows || []).find((w) => w.name === 'AI credits 明细');
+  ok(det2?.display === '已用 1166 / 1166 cr', `明细仍是具体用量，实际 ${det2?.display}`);
   world.usedMilli = 300000;           // 复原，避免影响后续
 }
 
