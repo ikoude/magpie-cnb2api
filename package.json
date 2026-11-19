@@ -5,6 +5,9 @@
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",
+  "scripts": {
+    "test": "node test/run.mjs"
+  },
   "bin": {
     "magpie-cnb2api-prune": "./tools/magpie-prune.mjs"
   },

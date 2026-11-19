@@ -114,10 +114,12 @@ function pickUri(text, port = 9001) {
   return m ? `https://${materialize(m[0], port)}` : null;
 }
 
-// 日志里可能打印多次（热重启），最后一条才有效；{{port}} 要替换成真实端口
+// 日志里可能打印多次（热重启），最后一条才有效；{{port}} 要替换成真实端口。
+// 上游 start.sh 打印时不带引号，但 set -x / 手工 echo "PROXY_URI=$URL"
+// 会带一层引号，所以 = 与地址之间允许引号和空白。
 function pickUriFromLog(text, port = 9001) {
   if (!text) return null;
-  const all = [...text.matchAll(/PROXY_URI=(https?:\/\/\S+)/g)];
+  const all = [...text.matchAll(/PROXY_URI=\s*["']?(https?:\/\/\S+)/g)];
   for (let i = all.length - 1; i >= 0; i--) {
     const u = materialize(strip(all[i][1]).replace(/["'<>]/g, ''), port);
     if (URI_RE.test(u)) return u;
@@ -744,8 +746,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   // 调用方靠它决定要不要把 state.recovering 置上：没启动起来还标"正在恢复"，
   // 会让后面的请求白等 90 秒去拿一个注定拿不到的地址。
   //
-  // 提交成功后 START_COOLDOWN_MS 内不再重复提交：waitForReady 每 6 秒
-  // refresh 一轮，而工作区从 start 到进入 running 有几十秒，这段窗口里每轮
+  // 提交成功后 START_COOLDOWN_MS 内不再重复提交：waitForReady 会反复
+  // refresh，而工作区从 start 到进入 running 有几十秒，这段窗口里每轮
   // 都会命中"已停止"分支 —— 不设间隔就会把 start 打成连发。
   const START_COOLDOWN_MS = 60_000;
 
@@ -994,8 +996,13 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
 
   // 有界等待：轮询直到拿到可用地址。用于首请求和"检测到停止"之后，
   // 因为工作区从 start 到代理监听 9001 通常需要 30~90 秒。
+  //
+  // 间隔用退避而不是固定 6 秒：工作区往往 1~2 秒就起来、额度用尽更是
+  // 第一轮 refresh 就能判定，固定长间隔会让这些情况白等一轮。
+  // 长冷启动时按 6 秒封顶，轮询次数仍与原来同量级。
   async function waitForReady(budgetMs) {
     const deadline = Date.now() + budgetMs;
+    let gap = 800;
     while (Date.now() < deadline) {
       await refresh('wait');
       if (isReady()) return true;
@@ -1005,7 +1012,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       if (state.quotaBlocked) return false;
       const left = deadline - Date.now();
       if (left <= 0) break;
-      await new Promise((r) => setTimeout(r, Math.min(6000, left)));
+      await new Promise((r) => setTimeout(r, Math.min(gap, left)));
+      gap = Math.min(6000, Math.round(gap * 1.8));
     }
     if (!isReady()) warn(`等待 ${Math.round(budgetMs / 1000)}s 后仍无可用地址 · ${state.lastError || '原因未知'}`);
     return false;
