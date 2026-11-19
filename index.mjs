@@ -1020,12 +1020,12 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     const changed = uri !== state.uri;
     if (changed) {
       // 日志里也打码：日志常被贴出来求助，完整地址等于公开端点
-      say(`${state.uri ? '地址已更新' : '已就绪'} · ${maskHost(hostOf(uri))}`);
+      say(`${state.uri ? '地址已更新' : '就绪'} · ${maskHost(hostOf(uri))}`);
       state.uri = uri;
     }
 
     if (!(await health(uri))) {
-      state.lastError = `地址尚未就绪 · ${uri}`;
+      state.lastError = `地址尚未就绪 · ${maskHost(hostOf(uri))}`;
       state.failures += 1;
       return false;
     }

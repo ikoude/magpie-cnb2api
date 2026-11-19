@@ -495,8 +495,8 @@ magpie quota refresh cnb2api --json  # 重新获取一次，查看原始数据
 日志中的账号前缀用于区分账号：
 
 ```
-[alice | acme/gateway]  已就绪 · 1a2b****-9001.cnb.run
-[alice | gamma/gateway] 已就绪 · 3c4d****-9001.cnb.run
+[alice | acme/gateway]  就绪 · 1a2b****-9001.cnb.run
+[alice | gamma/gateway] 就绪 · 3c4d****-9001.cnb.run
 ```
 
 ### 8.2 常见现象
