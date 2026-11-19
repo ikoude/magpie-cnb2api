@@ -254,6 +254,11 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       // 避免并发请求各自跑一遍 refresh + waitForReady。
       recoveringPromise: null,
       autoStartBlocked: false,
+      // 拉起前的额度闸门：quotaGate 是这次查询的缓存（含"可用"结论），
+      // quotaBlocked 只在真被拦下时有值，供报错/工具输出引用。
+      quotaGate: null,
+      quotaBlocked: null,
+      startAt: 0,
       fatal: false,
       repoTried: false,
       repoTriedAt: 0,
@@ -552,25 +557,94 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     }
   }
 
-  async function startWorkspace() {
-    if (state.starting) return;
+  // ---------- 拉起前的额度闸门 ----------
+  //
+  // cnb2api 是 AI 网关：所属组织的 AI credits 一旦用尽，它对每个请求都回
+  //   402 [EXCEEDING_LIMIT] AI 积分已用尽
+  // 这时候把工作区拉起来只会白烧核时 —— 还得再等 30~90 秒冷启动，最后仍然
+  // 只拿到 402。所以拉起之前先查一次额度，用尽就直接不拉。
+  //
+  // 原则是**查不到就放行**：缺 group-resource:r、接口临时抽风、字段换了名字，
+  // 都不能当成"额度用尽"。拦住一个本来能用的工作区，比放过一个注定 402 的更糟。
+  const QUOTA_GATE_TTL = 60_000;   // 巡检间隔默认 120s，同一次巡检内复用结论
+
+  function quotaBlockMessage(c) {
+    const used = c.used != null ? num1(c.used) : '?';
+    const frozen = c.frozen ? `，冻结 ${num1(c.frozen)}` : '';
+    return `AI credits 已用尽（已用 ${used} / ${num1(c.total)} cr${frozen}）`
+      + '· 没有拉起工作区，额度恢复后会自动再试';
+  }
+
+  // 返回 null = 可以拉；返回对象 = 用尽了，别拉。
+  // fresh = 不信缓存，现查一次：用户刚充完额度就又点"拉起"，不该被
+  // 一分钟前的旧结论挡住。
+  async function quotaGate(fresh = false) {
+    const org = String(cfg.repo || '').split('/')[0];
+    // 令牌/仓库还没配好时轮不到额度说话，交给后面的检查报错
+    if (!org || !cfg.token) return null;
+
+    const cached = state.quotaGate;
+    if (!fresh && cached && cached.org === org && Date.now() - cached.at < QUOTA_GATE_TTL) {
+      return cached.blocked;
+    }
+
+    const q = await charge(org).catch(() => null);
+    const c = q?.credit;
+    // remainMilli 已经是 max(0, 总额 - 已用 - 冻结)，等于 0 就真没得用了
+    const blocked = c && c.remainMilli != null && c.remainMilli <= 0
+      ? { org, message: quotaBlockMessage(c), credit: c }
+      : null;
+    state.quotaGate = { org, at: Date.now(), blocked };
+    return blocked;
+  }
+
+  // 返回 true = 已经提交（或正在提交）拉起；false = 没拉起来。
+  // 调用方靠它决定要不要把 state.recovering 置上：没拉起来还标"正在恢复"，
+  // 会让后面的请求白等 90 秒去拿一个注定拿不到的地址。
+  //
+  // 提交成功后 START_COOLDOWN_MS 内不再重复提交：waitForReady 每 6 秒
+  // refresh 一轮，而工作区从 start 到进入 running 有几十秒，这段窗口里每轮
+  // 都会命中"已停止"分支 —— 不设间隔就会把 start 打成连发。
+  const START_COOLDOWN_MS = 60_000;
+
+  async function startWorkspace(freshQuota = false) {
+    // 已有一次在飞：算"正在拉起"，让并发调用方一起等它，而不是各自再发一次
+    if (state.starting) return true;
+    // 冷却期对显式调用同样有效：刚刚提交过就不该再提交一次
+    if (state.startAt && Date.now() - state.startAt < START_COOLDOWN_MS) return true;
     state.starting = true;
     try {
+      const gate = await quotaGate(freshQuota);
+      if (gate) {
+        // 同一个结论只喊一次，别让巡检/等待循环把日志刷满
+        const already = !!state.quotaBlocked;
+        state.quotaBlocked = gate;
+        state.lastError = gate.message;
+        if (!already) warn(gate.message);
+        return false;
+      }
+      state.quotaBlocked = null;
+
       say('工作区未运行，正在拉起');
       await api(`/${cfg.repo}/-/workspace/start`, {
         method: 'POST',
         body: JSON.stringify({ branch: cfg.branch }),
         timeout: 60000,
       });
+      state.startAt = Date.now();
       say('启动已提交，等待代理监听');
+      return true;
     } catch (e) {
       if (e?.permission) {
         // 不是致命错误：地址还能跟随，只是不会自动重启
         state.autoStartBlocked = true;
+        state.lastError = '无法自动拉起 · 令牌缺 repo-cnb-trigger:rw';
         warn(`无法自动拉起，地址仍会跟随 · 补上 repo-cnb-trigger:rw 才能自动重启 · ${e.message}`);
       } else {
         warn(`拉起失败 · ${e.message}`);
+        state.lastError = `拉起失败 · ${e.message}`;
       }
+      return false;
     } finally {
       state.starting = false;
     }
@@ -709,7 +783,9 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           return state;
         }
         state.lastError = `仓库 ${cfg.repo} 从未启动过工作区`;
-        if (cfg.autoStart) await startWorkspace();
+        if (cfg.autoStart) {
+          if (await startWorkspace()) state.recovering = true;
+        }
         return state;
       }
       state.sn = ws.sn;
@@ -718,10 +794,12 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       if (ws.status !== 'running') {
         state.lastError = `工作区已停止（sn=${ws.sn}）`;
         if (cfg.autoStart) {
-          await startWorkspace();
-          // 拉起后工作区要几十秒才真正就绪，同一次调用里先不等，
-          // 但标记"正在等启动"，让 waitForReady 去轮询
-          state.recovering = true;
+          // 拉开之后工作区要几十秒才真正就绪，同一次调用里先不等，
+          // 只标记"正在等启动"，让 waitForReady 去轮询。
+          // 没提交成功（额度用尽、缺权限、接口报错）就**不要**标 —— 否则
+          // 后面的请求会白等 90 秒去拿一个不会出现的地址。
+          const started = await startWorkspace();
+          state.recovering = started;
         }
         return state;
       }
@@ -774,6 +852,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       if (state.uri) return true;
       // token 无效 / 权限不足是确定性的，再等也不会好，立即放弃
       if (state.fatal) return false;
+      // 额度用尽同理：工作区根本没被拉起，再等也等不出地址
+      if (state.quotaBlocked) return false;
       const left = deadline - Date.now();
       if (left <= 0) break;
       await new Promise((r) => setTimeout(r, Math.min(6000, left)));
@@ -1236,6 +1316,10 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       state.lastCheck = 0;
       state.readyPromise = null;
       state.discovering = null;
+      // 额度是按组织算的，换了令牌/仓库就得重新查
+      state.quotaGate = null;
+      state.quotaBlocked = null;
+      state.startAt = 0;
       // 定时器保留（周期没变），但立刻触发一轮
       if (state.timer) state.readyPromise = tick(cur()).catch(() => {});
     } else {
@@ -1883,6 +1967,11 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             if (!state.uri) {
               await refresh('no-uri');
               if (!state.uri && !state.fatal && !(await waitForReady(60_000))) {
+                // 额度用尽是"不必拉起"，不是"没起来"，别让人去查工作区
+                if (state.quotaBlocked) {
+                  return oaiError(503, state.quotaBlocked.message,
+                    'AI credits 补足后工作区会自动拉起，也可以再调一次 cnb2api_workspace_start');
+                }
                 // 走到这里说明不是 token/权限问题，而是工作区没起来
                 return oaiError(503,
                   `cnb2api 地址不可用：${state.lastError || '工作区未就绪'}`,
@@ -1899,6 +1988,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
                   hint = '检查插件选项里的 repo，可填 org/repo、仓库名、或仓库页面地址';
                 } else if (/令牌无效|401/.test(why)) {
                   hint = 'CNB → 头像 → 访问令牌，重新生成一个（勾上必需权限）后填回插件选项';
+                } else if (state.quotaBlocked) {
+                  hint = 'AI credits 补足后工作区会自动拉起，也可以再调一次 cnb2api_workspace_start';
                 } else {
                   hint = `检查必需权限 ${PERMISSIONS.filter((p) => p.need === 'required').map((p) => p.scope).join(' + ')}`;
                 }
@@ -1923,6 +2014,15 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               // 401 说明 proxyKey 不对：补一句人话，并保留 401 让 magpie 标记账号
               if (res.status === 401) {
                 return annotate(res, `cnb2api 拒绝了密钥 · 检查 ${cfg.repo || '这个仓库'} 的 PROXY_KEY 是否和它 .cnb.yml 里 env 的值一致`);
+              }
+              // 402 EXCEEDING_LIMIT：组织的 AI credits 用尽。原文是一段
+              // 夹着 request id 的长句，翻成"该找谁、要不要重试"更有用。
+              if (res.status === 402) {
+                const body = await res.clone().text().catch(() => '');
+                if (/EXCEEDING_LIMIT|积分已用尽|credits are exhausted/i.test(body)) {
+                  return annotate(res,
+                    '额度用尽期间插件不会自动拉起工作区 · 补足后会自动再试');
+                }
               }
               return res;
             } catch (e) {
@@ -2113,7 +2213,14 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             if (state.status === 'running' && state.uri) {
               return [`已在运行 · ${maskHost(hostOf(state.uri))}`];
             }
-            await startWorkspace();
+            // 显式拉起：额度现查一次，别被一分钟前的旧结论挡住
+            const started = await startWorkspace(true);
+            if (!started) {
+              // 拦下来的原因（额度用尽 / 缺权限 / 接口报错）已经写在 lastError 里
+              return [state.quotaBlocked
+                ? state.quotaBlocked.message
+                : `没能拉起 · ${state.lastError || '原因未知'}`];
+            }
             const ok = await waitForReady(90_000).catch(() => false);
             return [ok
               ? `已拉起，可以用了 · ${maskHost(hostOf(state.uri))}`
