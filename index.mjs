@@ -786,6 +786,25 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return '识别中';
   }
 
+  // 徽标（账号名后那枚小字，magpie 的 plan 字段）：回答"现在能不能用"。
+  // 在跑不等于能用 —— 额度归零、地址不通时机器在转，请求却全被拒（402 / 连不上），
+  // 所以结论按可用性排，而不是按"在不在跑"排：
+  //   可用（在跑、地址通、额度够） · 无额（在跑，但 AI credits 归零）
+  //   掉线（在跑，但地址不通）     · 停止 / 未建 / 启动 / 异常 / 未知
+  // 一律两字：字数一样、中文字宽一致，加上 .acc-line > .plan 的 min-width: 3em，
+  // 不同账号的徽标宽度才一致，不会随组织名长短漂移。
+  // 宿主不认中文，所以不会把它当订阅计划做首字母大写之类的改写。
+  function badgeWord(alive, creditDead) {
+    if (alive) return creditDead ? '无额' : '可用';
+    if (state.fatal) return '异常';
+    const st = state.status;
+    if (st === 'running') return '掉线';
+    if (st === 'closed') return '停止';
+    if (st === 'none') return '未建';
+    if (st === 'building') return '启动';
+    return '未知';
+  }
+
   // 返回 null = 可以拉；返回对象 = 用尽了，别拉。
   // fresh = 不信缓存，现查一次：用户刚充完额度就又点"启动"，不该被
   // 一分钟前的旧结论挡住。
@@ -2219,20 +2238,9 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             refreshInBackground('usage');
           }
 
-          // 账号名后那枚小徽标就是 plan 字段，magpie 原样显示。宿主不认中文，
-          // 所以中文在这里是安全的（不会被首字母大写或当作订阅计划转换）。
-          // 一律两字：字数一样，宽度才一样（.acc-line > .plan 另有 min-width: 3em，
-          // 中文字宽相同，于是四个账号的徽标在同一列上对齐）。
-          // 词与 workspace 行同源，只是缩到两字：运行 / 停止 / 未建 / 启动；
-          // 硬失败（令牌、仓库不存在）记"异常"，首屏还没查到记"未知"。
-          const planWord = state.fatal ? '异常'
-            : state.status === 'running' ? '运行'
-              : state.status === 'closed' ? '停止'
-                : state.status === 'none' ? '未建'
-                  : state.status === 'building' ? '启动'
-                    : '未知';
+          // 徽标（plan 字段）要等额度查完才知道"能不能用"，
+          // 所以在窗口都拼好之后再赋值：见下面的 badgeWord。
           const out = {
-            plan: planWord,
             // 账号名用 CNB 用户名，多账号才能分清谁是谁
             ...(accountName ? { user: accountName } : {}),
           };
@@ -2346,7 +2354,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           // 3) 工作区行放到最后拼：它要带上"额度有没有归零"这个结论，
           //    而额度是上面才查到的。一处拼装，就不必再回头改写字符串。
           wsRow.display = workspaceLine(alive, creditDead);
-          // aside 的语义是"用掉它不影响账号可用"。额度归零时这句话不成立，
+          // 徽标同样要等额度结论：它在账号名后，是"能不能用"的第一眼答案
+          out.plan = badgeWord(alive, creditDead);          // aside 的语义是"用掉它不影响账号可用"。额度归零时这句话不成立，
           // 它恰恰决定这个账号能不能用。
           wsRow.aside = !creditDead;
 

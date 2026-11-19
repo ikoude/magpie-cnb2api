@@ -124,7 +124,7 @@ console.log('\n[3] 额度正常时仍然照常显示');
   ok(names[0] === 'AI credits' && names[1] === 'dev core-hours',
     `额度行从两个额度开始，实际 ${names.join(' / ')}`);
   ok(names.indexOf('workspace') >= 2, `workspace 不再占额度行的位置，实际 ${names.join(' / ')}`);
-  ok(out.plan === '运行', `运行中的徽标是"运行"，实际 ${out.plan}`);
+  ok(out.plan === '可用', `在跑、地址通、额度够 → 徽标"可用"，实际 ${out.plan}`);
 }
 
 console.log('\n[4] 地址不通：探活限时，不让面板干等');
@@ -137,6 +137,7 @@ console.log('\n[4] 地址不通：探活限时，不让面板干等');
   ok(ms < 3500, `usage 在 ${ms}ms 内返回（探活有超时）`);
   const credit = (out.windows || []).find((w) => w.name === 'AI credits');
   ok(!!credit && credit.amount === 300, '额度照样拿到，不被探活拖累');
+  ok(out.plan === '掉线', `在跑但地址不通 → 徽标"掉线"，实际 ${out.plan}`);
 }
 
 console.log('\n[5] 仓库未确定：说清楚，不是静默');
@@ -161,6 +162,7 @@ console.log('\n[6] 额度打满但工作区在跑：不能显示 ok');
   ok(/^运行中 · /.test(ws?.display || ''), `状态词降级为运行中，实际 ${ws?.display}`);
   ok(!/credits|额度/.test(ws?.display || ''), 'workspace 行不再夹带额度话术');
   ok(ws?.aside === false, 'aside 置 false：它确实影响可用性');
+  ok(out.plan === '无额', `在跑但额度归零 → 徽标"无额"，实际 ${out.plan}`);
   const credit = (out.windows || []).find((w) => w.name === 'AI credits');
   ok(credit?.used === 100, `进度条 100%，实际 ${credit?.used}`);
 }
