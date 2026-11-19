@@ -588,7 +588,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       return cached.blocked;
     }
 
-    const q = await charge(org).catch(() => null);
+    const q = await charge(org, 8000).catch(() => null);
     const c = q?.credit;
     // remainMilli 已经是 max(0, 总额 - 已用 - 冻结)，等于 0 就真没得用了
     const blocked = c && c.remainMilli != null && c.remainMilli <= 0
@@ -862,6 +862,26 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return false;
   }
 
+  // 只等首轮识别，不推进任何状态（尤其不触发 start）。
+  // usage 首屏用：
+  //   工作区在跑 → 等地址（读日志一般几百毫秒，拿到就能显示 ok）
+  //   工作区已停止 / 从没启动过 → 立刻返回，等地址没有意义
+  async function waitForUri(ms) {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (state.uri) return true;
+      if (state.status && state.status !== 'running') return false;
+      await new Promise((r) => setTimeout(r, 120));
+    }
+    return !!state.uri;
+  }
+
+  // 后台刷新：界面钩子用它推进状态，异常只记一行，不抛回宿主
+  function refreshInBackground(reason) {
+    if (state.ticking) return;   // 巡检正在跑，跟着它就行
+    refresh(reason).catch((e) => console.error('[usage] refresh err', e.message));
+  }
+
   // ---------- 组织额度（真实数据，用于 usage 钩子） ----------
   //   GET /{org}/-/charge/quota          → { credit_in_milli:{total,free}, dev_in_sec:{total,free}, ... }
   //   GET /{org}/-/charge/volume         → { credit_in_milli: 496130, dev_in_sec: 440648, freeze_*: ... }
@@ -931,15 +951,26 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     };
   }
 
-  async function charge(org) {
+  // timeoutMs 给调用方决定：界面钩子等不起 20 秒，后台巡检可以慢慢来。
+  // 失败原因收集在 errors 里 —— 静默吞掉的话，面板上只会显示"查不到额度"，
+  // 谁也看不出是缺权限、超时，还是组织填错了。
+  async function charge(org, timeoutMs = 20000) {
+    const errors = [];
+    const grab = (path) => api(path, { timeout: timeoutMs })
+      .then((r) => r.json())
+      .catch((e) => {
+        // 只留「接口名 + 状态」，别把整条路径再贴一遍
+        errors.push(humanize(e).replace(`/${org}/-/charge/`, '').slice(0, 90));
+        return null;
+      });
     const [quota, volume, special] = await Promise.all([
-      api(`/${org}/-/charge/quota`).then((r) => r.json()).catch(() => null),
-      api(`/${org}/-/charge/volume`).then((r) => r.json()).catch(() => null),
-      api(`/${org}/-/charge/special-amount`).then((r) => r.json()).catch(() => null),
+      grab(`/${org}/-/charge/quota`),
+      grab(`/${org}/-/charge/volume`),
+      grab(`/${org}/-/charge/special-amount`),
     ]);
-    if (!quota && !volume) return null;
+    if (!quota && !volume) return { errors };
 
-    const res = {};
+    const res = { errors };
 
     // ---- credits ----
     // 统一在 milli 口径上算，最后再 /1000 显示，避免中间反复换算丢精度。
@@ -1018,7 +1049,24 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         bonusExpired: devBonus?.expired ?? false,
       };
     }
+    // 全成功时不留空数组，免得调用方以为有错
+    if (!errors.length) delete res.errors;
     return res;
+  }
+
+  // 面板展示用的一层短缓存：额度面板可能被频繁读（打开面板、每次请求后
+  // 刷新），没必要每次都打 3 个接口。10 秒内的重复读复用上次结果 ——
+  // 只影响展示，拉起前的闸门（quotaGate）不用它，那里的判断永远是现查的。
+  const usageQuotaCache = new Map();   // (令牌指纹, 组织) → { at, data }
+  async function chargeForUsage(org) {
+    // 键里必须带令牌指纹：同一个组织可能被不同人的令牌分别登录，
+    // 只按 org 缓存会让没权限的账号看到别人的额度。
+    const ck = `${fp(cfg.token)}|${org}`;
+    const hit = usageQuotaCache.get(ck);
+    if (hit && Date.now() - hit.at < 10_000) return hit.data;
+    const data = await charge(org, 4000);
+    usageQuotaCache.set(ck, { at: Date.now(), data });
+    return data;
   }
 
   const hostOf = (u) => { try { return new URL(u).host; } catch { return u || ''; } };
@@ -1364,13 +1412,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       state.readyPromise = tick(self).catch(() => {});
     }
     return state.readyPromise;
-  }
-
-  // 外部触发：马上刷新一次并等到结果（登录后、usage 被读时用）
-  async function kick(reason = 'kick') {
-    ensureTimer();
-    if (state.ticking) return state.readyPromise;   // 正在跑，跟着等同一个结果
-    return tick(cur());
   }
 
   // 登录时选的结束标记，跟在组织列表末尾表示"不再加了"
@@ -2085,17 +2126,19 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         const accountName = userName
           ? (authRepo ? `${userName} | ${authRepo}` : userName)
           : fromEmail;
-        // usage 是登录/打开插件界面时最早被调的钩子，顺势主动拉一次。
+        // usage 是界面钩子，**宿主等不起冷启动**：工作区停着时调 start 要
+        // 1~10 秒，探一个不通的地址要好几秒 —— 一旦在这里同步等，额度面板
+        // 就是一片空白，用户看到的就是"无法获取额度"。
+        //
+        // 所以这里只读现成状态，外加一个很短的首屏等待；真正推进状态的事
+        // （识别地址、拉起工作区）交给后台定时器，不阻塞这次返回。
+        ensureTimer();
         if (!state.uri) {
-          await kick('usage-first').catch(() => {});
-        } else {
-          ensureTimer();   // 已经有地址了，保证定时器在跑
-          // 有地址时也要刷新一次：空闲自动停止依赖这次巡检，
-          // 只在后台等定时器的话，用户打开界面看额度时永远不会触发。
-          // 用节流避免频繁调用 usage 时反复打 CNB 接口。
-          if (Date.now() - state.lastCheck > 15_000) {
-            await refresh('usage').catch((e) => console.error('[usage] refresh err', e.message));
-          }
+          // 首轮识别（列工作区 + 读日志）通常 0.2~1 秒，给它一点时间；
+          // 但绝不等到 /workspace/start 返回 —— 是否要拉起由后台决定。
+          await waitForUri(1200);
+        } else if (Date.now() - state.lastCheck > 15_000) {
+          refreshInBackground('usage');
         }
 
         const out = {
@@ -2107,7 +2150,11 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         // 1) 工作区/地址状态
         // 这一行回答"这个账号现在能不能用"。地址是 API 端点，默认打码，
         // 因为额度面板常被截图分享。
-        const alive = state.uri ? await health(state.uri, 4000) : false;
+        //
+        // 只对"正在运行"的工作区探活：工作区已停止时那个地址必然连不上，
+        // 探它只会白等满超时。1.5 秒够判定"地址通了没"（通的时候通常 <200ms）。
+        const running = state.status === 'running';
+        const alive = state.uri && running ? await health(state.uri, 1500) : false;
         const host = state.uri ? hostOf(state.uri) : '';
         out.windows = [{
           name: 'workspace',
@@ -2115,7 +2162,10 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           aside: true,
           display: alive
             ? `ok · ${maskHost(host)}`
-            : `不可用 · ${state.lastError || '尚未就绪'}`,
+            : `不可用 · ${!state.uri
+              ? (state.lastError
+                || (state.status === 'none' ? '这个仓库还没有工作区' : '正在识别工作区'))
+              : (running ? (state.lastError || '地址未响应') : '工作区已停止')}`,
         }];
 
         // 想看完整地址时设这个环境变量（分享截图前记得关掉）
@@ -2133,10 +2183,20 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         }
 
         // 2) CNB 真实额度（需要 account-engage:r / group-resource:r）
-        const org = cfg.repo.split('/')[0];
-        if (org && cfg.token) {
+        //
+        // 查不到时**必须说明原因**，否则面板上就是一片空白，用户只能看到
+        // "没有额度"却不知道是缺权限、超时，还是组织不对。额度窗口用
+        // text:true（纯文本，不画进度条），aside:true（查不到不代表账号不可用）。
+        const org = String(cfg.repo || '').split('/')[0];
+        const quotaUnavailable = (why) => {
+          out.windows.push({ name: 'AI credits', aside: true, text: true, display: why });
+        };
+        if (!org || !cfg.token) {
+          quotaUnavailable(!cfg.token ? '查不到 · 还没读到 CNB 访问令牌' : '查不到 · 仓库未确定');
+        } else {
           try {
-            const q = await charge(org);
+            // 界面钩子等不起：4 秒拿不到就照实报"超时"，不拖住整个面板
+            const q = await chargeForUsage(org);
             if (q?.credit && q.credit.used != null) {
               const c = q.credit;
               out.windows.push({
@@ -2156,6 +2216,18 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
                   `可用 ${num1(c.remain)}`,
                 ].filter(Boolean).join(' · '),
               });
+            } else if (q?.credit) {
+              // 总额拿到了、已用量没拿到（volume 单独失败）：能显示就别空着
+              const c = q.credit;
+              out.windows.push({
+                name: 'AI credits',
+                aside: true,
+                text: true,
+                display: `可用 ${num1(c.remain)} / ${num1(c.total)} cr · 已用量没取到`
+                  + (q.errors?.length ? `（${q.errors[0]}）` : ''),
+              });
+            } else {
+              quotaUnavailable(`查不到 · ${q?.errors?.[0] || '令牌可能缺 group-resource:r'}`);
             }
             if (q?.devHours && q.devHours.used != null) {
               const d = q.devHours;
@@ -2174,6 +2246,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             }
           } catch (e) {
             out.error = `额度查询失败 · ${e.message}`;
+            quotaUnavailable(`查不到 · ${e.message}`);
           }
         }
         return out;
@@ -2237,8 +2310,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           return forEachAccount(async () => {
             const org = (cfg.repo || '').split('/')[0];
             if (!org || !cfg.token) return ['还没配好令牌或仓库，查不了额度'];
-            const q = await charge(org).catch((e) => ({ error: e.message }));
-            if (q?.error) return [`查询失败 · ${q.error}`];
+            const q = await charge(org, 8000).catch((e) => ({ errors: [e.message] }));
             const lines = [];
             if (q?.devHours) {
               const d = q.devHours;
@@ -2250,7 +2322,9 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               lines.push(`AI Credits 已用 ${num1(c.used)} / ${num1(c.total)} cr`
                 + ` · 剩余 ${num1(c.remain)} cr`);
             }
-            if (!lines.length) lines.push('没拿到额度数据 · 多半是令牌缺 group-resource:r 权限');
+            if (!lines.length) {
+              lines.push(`没拿到额度数据 · ${q?.errors?.[0] || '多半是令牌缺 group-resource:r 权限'}`);
+            }
             return lines;
           });
         },
