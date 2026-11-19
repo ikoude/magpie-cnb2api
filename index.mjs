@@ -729,11 +729,43 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   // 都不能当成"额度用尽"。拦住一个本来能用的工作区，比放过一个注定 402 的更糟。
   const QUOTA_GATE_TTL = 60_000;   // 巡检间隔默认 120s，同一次巡检内复用结论
 
+  // 额度用尽时的统一说法：<现象> · <数值> · <处置>
+  // 界面上同一件事只换尾巴（请求会被拒绝 / 恢复后自动启动），现象和数值一字不改。
   function quotaBlockMessage(c) {
     const used = c.used != null ? num1(c.used) : '?';
     const frozen = c.frozen ? `，冻结 ${num1(c.frozen)}` : '';
-    return `AI credits 已用尽（已用 ${used} / ${num1(c.total)} cr${frozen}）`
-      + '· 未启动工作区 · 额度恢复后将自动重试';
+    return `AI credits 已用尽 · 已用 ${used} / ${num1(c.total)} cr${frozen} · 恢复后自动启动`;
+  }
+
+  // workspace 行的唯一说法：<状态词> · <原因 / 地址>
+  // 状态词只有六个，别处不再出现 "ok / 工作区在跑 / 该仓库尚无工作区" 这类混写：
+  //   就绪（在跑、地址通、额度够） · 运行中（在跑但额度归零）
+  //   无响应（在跑但地址不通）     · 已停止 / 无工作区 / 启动中
+  //   识别中（首屏还没查到）       · 不可用（令牌、权限、仓库这类硬失败）
+  // 拼装只此一处：调用方给两个事实（地址通没通、额度够不够），文案由它决定。
+  function workspaceLine(alive, creditDead) {
+    const host = state.uri ? maskHost(hostOf(state.uri)) : '';
+    const tail = host ? ` · ${host}` : '';
+    if (alive) {
+      return creditDead
+        ? `运行中 · AI credits 已用尽，请求会被拒绝${tail}`
+        : `就绪${tail}`;
+    }
+    const st = state.status;
+    if (st === 'running') return `无响应${tail}`;
+    // 硬失败优先：仓库不存在、令牌无效这类原因比"没工作区"更重要
+    if (state.fatal) return `不可用 · ${state.lastError || '原因未知'}`;
+    if (st === 'closed' || st === 'none' || st === 'building') {
+      const word = st === 'closed' ? '已停止' : st === 'none' ? '无工作区' : '启动中';
+      if (creditDead) {
+        return `${word} · AI credits 已用尽，${cfg.autoStart ? '恢复后自动启动' : '恢复后需手动启动'}`;
+      }
+      if (state.recovering) return `${word} · ${st === 'none' ? '正在创建' : '正在自动启动'}`;
+      return word;
+    }
+    // 非致命错误只在给不出状态词时才占整行；"识别中"留给后台，1 秒内就会变
+    if (state.lastError) return `不可用 · ${state.lastError}`;
+    return '识别中';
   }
 
   // 返回 null = 可以拉；返回对象 = 用尽了，别拉。
@@ -2184,23 +2216,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           const running = state.status === 'running';
           const alive = state.uri && running ? await health(state.uri, 1500) : false;
           const host = state.uri ? hostOf(state.uri) : '';
-          const wsRow = {
-            name: 'workspace',
-            // aside：用掉它不影响账号本身可用（文档语义）
-            aside: true,
-            display: alive
-              ? `ok · ${maskHost(host)}`
-              : `不可用 · ${!state.uri
-                ? (state.lastError
-                  || (state.status === 'none' ? '该仓库尚无工作区' : '正在识别工作区'))
-                : (running ? (state.lastError || '地址未响应') : '工作区已停止')}`,
-          };
+          const wsRow = { name: 'workspace', aside: true, display: '' };
           out.windows = [wsRow];
-
-          // 想看完整地址时设这个环境变量（分享截图前记得关掉）
-          if (process.env.CNB2API_SHOW_FULL_HOST === '1' && alive) {
-            out.windows[0].display = `ok · ${host}`;
-          }
 
           // 1b) 自动重启状态：权限不够时明确告诉用户"能跟随但不会重启"
           if (cfg.autoStart && state.status !== 'running' && state.autoStartBlocked) {
@@ -2272,22 +2289,16 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             }
           }
 
-          // 3) 把"额度已归零"回填到工作区那一行
-          //    在跑：地址通不代表能用，请求会被上游以 402 拒绝，改为 aside:false
-          //    （它确实影响可用性），文案直接说清楚，不要让人看到 ok 就以为能用。
-          //    已停：补一句"不会自动启动"，否则用户以为插件把重启忘了。
-          if (creditDead) {
-            if (alive) {
-              wsRow.aside = false;
-              wsRow.display = `不可用 · 工作区在跑但额度已用尽 · 请求会被拒绝 · ${maskHost(host)}`;
-            } else if (/工作区已停止|尚无工作区|从未启动过工作区/.test(wsRow.display)
-              && !/额度|credits/i.test(wsRow.display)) {
-              // lastError 已经是额度闸门那句话时就别重复了；
-              // "正在识别工作区"这种 1 秒内的过渡态也不套结论，免得看着自相矛盾
-              wsRow.display += /尚无工作区|从未启动过工作区/.test(wsRow.display)
-                ? ' · 额度已用尽，暂时无法创建'
-                : ' · 额度已用尽，不会自动启动';
-            }
+          // 3) 工作区行放到最后拼：它要带上"额度有没有归零"这个结论，
+          //    而额度是上面才查到的。一处拼装，就不必再回头改写字符串。
+          wsRow.display = workspaceLine(alive, creditDead);
+          // aside 的语义是"用掉它不影响账号可用"。额度归零时这句话不成立，
+          // 它恰恰决定这个账号能不能用。
+          wsRow.aside = !creditDead;
+
+          // 想看完整地址时设这个环境变量（分享截图前记得关掉）
+          if (process.env.CNB2API_SHOW_FULL_HOST === '1' && alive && host) {
+            wsRow.display = wsRow.display.replace(maskHost(host), host);
           }
           return out;
         });
@@ -2305,8 +2316,10 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         async execute() {
           return forEachAccount(async (ctx) => {
             if (!state.sn) await refresh('tool-status').catch(() => {});
+            const word = { running: '运行中', closed: '已停止', none: '无工作区', building: '启动中' }[state.status]
+              || (state.status ? state.status : '识别中');
             const lines = [
-              `状态 ${state.status || '未知'}`,
+              `状态 ${word}`,
               `仓库 ${cfg.repo || '未确定'}`,
               `地址 ${state.uri ? maskHost(hostOf(state.uri)) : '无'}`,
             ];
@@ -2324,7 +2337,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         async execute() {
           return forEachAccount(async () => {
             if (state.status === 'running' && state.uri) {
-              return [`已在运行 · ${maskHost(hostOf(state.uri))}`];
+              return [`运行中 · ${maskHost(hostOf(state.uri))}`];
             }
             // 显式启动：额度现查一次，别被一分钟前的旧结论挡住
             const started = await startWorkspace(true);
@@ -2336,8 +2349,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             }
             const ok = await waitForReady(90_000).catch(() => false);
             return [ok
-              ? `已启动 · 地址可用 · ${maskHost(hostOf(state.uri))}`
-              : `启动已提交 · 尚未就绪 · ${state.lastError || '等待中'} · 请稍后查询或直接发起请求`];
+              ? `就绪 · ${maskHost(hostOf(state.uri))}`
+              : `启动中 · ${state.lastError || '等待网关就绪'} · 完成后可直接发起请求`];
           });
         },
       },
@@ -2349,21 +2362,21 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         async execute() {
           return forEachAccount(async () => {
             const org = (cfg.repo || '').split('/')[0];
-            if (!org || !cfg.token) return ['令牌或仓库尚未配置 · 无法查询额度'];
+            if (!org || !cfg.token) return ['查不到 · 令牌或仓库尚未配置'];
             const q = await charge(org, 8000).catch((e) => ({ errors: [e.message] }));
             const lines = [];
             if (q?.devHours) {
               const d = q.devHours;
-              lines.push(`核时 已用 ${num1(d.used)} / ${num1(d.total)} h`
-                + ` · 剩余 ${num1(d.remain)} h${d.frozen ? ` · 冻结 ${num1(d.frozen)}` : ''}`);
+              lines.push(`核时 · 已用 ${num1(d.used)} / ${num1(d.total)} h`
+                + ` · 冻结 ${num1(d.frozen)} h · 可用 ${num1(d.remain)} h`);
             }
             if (q?.credit) {
               const c = q.credit;
-              lines.push(`AI credits 已用 ${num1(c.used)} / ${num1(c.total)} cr`
-                + ` · 剩余 ${num1(c.remain)} cr`);
+              lines.push(`AI credits · 已用 ${num1(c.used)} / ${num1(c.total)} cr`
+                + ` · 冻结 ${num1(c.frozen)} cr · 可用 ${num1(c.remain)} cr`);
             }
             if (!lines.length) {
-              lines.push(`未获取到额度数据 · ${q?.errors?.[0] || '通常为令牌缺少 group-resource:r 权限'}`);
+              lines.push(`查不到 · ${q?.errors?.[0] || '令牌可能缺少 group-resource:r'}`);
             }
             return lines;
           });

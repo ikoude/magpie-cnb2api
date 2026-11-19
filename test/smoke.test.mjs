@@ -57,6 +57,7 @@ console.log('\n[工具]');
 const st = await plugin.tool.cnb2api_workspace_status.execute({});
 ok(/地址 ab12\*\*\*\*-9001/.test(st), `status 输出 ${st}`);
 const q = await plugin.tool.cnb2api_quota.execute({});
-ok(/AI credits 已用 800 \/ 1200/.test(q), `quota 输出 ${q}`);
+ok(/AI credits · 已用 800 \/ 1200 cr/.test(q), `quota 输出 ${q}`);
+ok(/可用 400 cr/.test(q), `用"可用"而不是"剩余"，实际 ${q}`);
 
 summary();

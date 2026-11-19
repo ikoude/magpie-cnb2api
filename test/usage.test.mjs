@@ -75,7 +75,7 @@ console.log('\n[1] 工作区已停止 + start 很慢：usage 不能等它');
   ok(!!credit, '额度卡片有 AI credits 行');
   ok(credit && credit.used != null, `额度带读数 used=${credit?.used}`);
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
-  ok(/工作区已停止/.test(ws?.display || ''), `workspace 行说明已停止，实际 ${ws?.display}`);
+  ok(ws?.display === '已停止', `workspace 行只说状态，实际 ${ws?.display}`);
 }
 
 console.log('\n[2] 额度接口 403（缺 group-resource:r）：写明原因，不能空白');
@@ -98,6 +98,8 @@ console.log('\n[3] 额度正常时仍然照常显示');
   const credit = (out.windows || []).find((w) => w.name === 'AI credits');
   ok(credit?.amount === 300 && credit?.limit === 1166, `已用 300 / 1166，实际 ${credit?.amount}/${credit?.limit}`);
   ok(/可用 866/.test(credit?.display || ''), `可用 866，实际 ${credit?.display}`);
+  const ws = (out.windows || []).find((w) => w.name === 'workspace');
+  ok(/^就绪 · /.test(ws?.display || ''), `可用时写就绪，实际 ${ws?.display}`);
 }
 
 console.log('\n[4] 地址不通：探活限时，不让面板干等');
@@ -131,8 +133,8 @@ console.log('\n[6] 额度打满但工作区在跑：不能显示 ok');
   const { plugin, auth } = await boot();
   const out = await plugin.auth.usage(async () => auth);
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
-  ok(/额度已用尽/.test(ws?.display || ''), `点明额度用尽，实际 ${ws?.display}`);
-  ok(!/^ok/.test(ws?.display || ''), '不再以 ok 开头（地址通 ≠ 能用）');
+  ok(/^运行中 · AI credits 已用尽，请求会被拒绝/.test(ws?.display || ''),
+    `状态词 + 额度 + 后果，实际 ${ws?.display}`);
   ok(ws?.aside === false, 'aside 置 false：它确实影响可用性');
   const credit = (out.windows || []).find((w) => w.name === 'AI credits');
   ok(credit?.used === 100, `进度条 100%，实际 ${credit?.used}`);
@@ -144,24 +146,23 @@ console.log('\n[7] 额度打满且工作区已停：说明不会自动启动');
   const { plugin, auth } = await boot();
   const out = await plugin.auth.usage(async () => auth);
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
-  ok(/工作区已停止/.test(ws?.display || '') || /已用尽/.test(ws?.display || ''),
-    `说明停着且与额度有关，实际 ${ws?.display}`);
-  ok(/未启动工作区|不会自动启动/.test(ws?.display || ''),
-    `说明不会自动启动，实际 ${ws?.display}`);
+  ok(/^已停止 · AI credits 已用尽/.test(ws?.display || ''),
+    `状态词 + 额度，实际 ${ws?.display}`);
+  ok(/恢复后自动启动/.test(ws?.display || ''),
+    `说明会自己恢复，实际 ${ws?.display}`);
   world.usedMilli = 300000;           // 复原，避免影响后续
 }
 
 console.log('\n[8] 首屏还没识别完：过渡态不要套额度结论');
 {
-  // 识别慢于 1.2s 预算 —— 面板只能显示"正在识别工作区"，
+  // 识别慢于 1.2s 预算 —— 面板只能显示"识别中"，
   // 这时补一句"额度已用尽"会读着自相矛盾
   world.status = 'closed'; world.usedMilli = 1166000; world.empty = true; world.listDelayMs = 2500;
   const { plugin, auth } = await boot();
   const out = await plugin.auth.usage(async () => auth);
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
-  ok(/正在识别工作区/.test(ws?.display || ''), `过渡态照旧，实际 ${ws?.display}`);
-  ok(!/额度已用尽/.test(ws?.display || ''), '过渡态不追加额度结论');
-  ok(ws?.aside === true, '过渡态仍属 aside');
+  ok(ws?.display === '识别中', `过渡态只有一个词，实际 ${ws?.display}`);
+  ok(!/已用尽/.test(ws?.display || ''), '过渡态不追加额度结论');
   world.empty = false; world.usedMilli = 300000; world.listDelayMs = 0;
 }
 
