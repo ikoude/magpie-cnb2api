@@ -133,8 +133,8 @@ console.log('\n[6] 额度打满但工作区在跑：不能显示 ok');
   const { plugin, auth } = await boot();
   const out = await plugin.auth.usage(async () => auth);
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
-  ok(/^运行中 · AI credits 已用尽，请求会被拒绝/.test(ws?.display || ''),
-    `状态词 + 额度 + 后果，实际 ${ws?.display}`);
+  ok(/^运行中 · /.test(ws?.display || ''), `状态词降级为运行中，实际 ${ws?.display}`);
+  ok(!/credits|额度/.test(ws?.display || ''), 'workspace 行不再夹带额度话术');
   ok(ws?.aside === false, 'aside 置 false：它确实影响可用性');
   const credit = (out.windows || []).find((w) => w.name === 'AI credits');
   ok(credit?.used === 100, `进度条 100%，实际 ${credit?.used}`);
@@ -146,10 +146,9 @@ console.log('\n[7] 额度打满且工作区已停：说明不会自动启动');
   const { plugin, auth } = await boot();
   const out = await plugin.auth.usage(async () => auth);
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
-  ok(/^已停止 · AI credits 已用尽/.test(ws?.display || ''),
-    `状态词 + 额度，实际 ${ws?.display}`);
-  ok(/恢复后自动启动/.test(ws?.display || ''),
-    `说明会自己恢复，实际 ${ws?.display}`);
+  ok(ws?.display === '已停止', `只给状态词，实际 ${ws?.display}`);
+  const credit2 = (out.windows || []).find((w) => w.name === 'AI credits');
+  ok(/^已用尽 · /.test(credit2?.display || ''), `额度行点明已用尽，实际 ${credit2?.display}`);
   world.usedMilli = 300000;           // 复原，避免影响后续
 }
 

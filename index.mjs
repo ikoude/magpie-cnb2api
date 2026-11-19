@@ -737,29 +737,24 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return `AI credits 已用尽 · 已用 ${used} / ${num1(c.total)} cr${frozen} · 恢复后自动启动`;
   }
 
-  // workspace 行的唯一说法：<状态词> · <原因 / 地址>
-  // 状态词只有六个，别处不再出现 "ok / 工作区在跑 / 该仓库尚无工作区" 这类混写：
-  //   就绪（在跑、地址通、额度够） · 运行中（在跑但额度归零）
+  // workspace 行的唯一说法：<状态词> · <地址 / 原因>
+  // 一行只讲一件事：工作区在不在、地址通不通。额度一律留给它下面那行
+  // （AI credits / dev core-hours），因此这里不出现任何额度话术，避免两行重复。
+  //   就绪（在跑、地址通、额度够） · 运行中（在跑，但额度已归零）
   //   无响应（在跑但地址不通）     · 已停止 / 无工作区 / 启动中
   //   识别中（首屏还没查到）       · 不可用（令牌、权限、仓库这类硬失败）
-  // 拼装只此一处：调用方给两个事实（地址通没通、额度够不够），文案由它决定。
   function workspaceLine(alive, creditDead) {
     const host = state.uri ? maskHost(hostOf(state.uri)) : '';
     const tail = host ? ` · ${host}` : '';
-    if (alive) {
-      return creditDead
-        ? `运行中 · AI credits 已用尽，请求会被拒绝${tail}`
-        : `就绪${tail}`;
-    }
+    // 额度归零时用"运行中"而不是"就绪"：机器在跑，但这个账号用不了。
+    // 为什么用不了，看下一行的 AI credits（那里会写"已用尽"）。
+    if (alive) return creditDead ? `运行中${tail}` : `就绪${tail}`;
     const st = state.status;
     if (st === 'running') return `无响应${tail}`;
     // 硬失败优先：仓库不存在、令牌无效这类原因比"没工作区"更重要
     if (state.fatal) return `不可用 · ${state.lastError || '原因未知'}`;
     if (st === 'closed' || st === 'none' || st === 'building') {
       const word = st === 'closed' ? '已停止' : st === 'none' ? '无工作区' : '启动中';
-      if (creditDead) {
-        return `${word} · AI credits 已用尽，${cfg.autoStart ? '恢复后自动启动' : '恢复后需手动启动'}`;
-      }
       if (state.recovering) return `${word} · ${st === 'none' ? '正在创建' : '正在自动启动'}`;
       return word;
     }
@@ -2234,12 +2229,15 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           // "没有额度"却不知道是缺权限、超时，还是组织不对。额度窗口用
           // text:true（纯文本，不画进度条），aside:true（查不到不代表账号不可用）。
           const org = String(cfg.repo || '').split('/')[0];
-          let creditDead = false;   // 组织 AI credits 余额为 0（用于回头修正 workspace 那行）
+          let creditDead = false;   // 组织 AI credits 余额为 0：workspace 行降级为"运行中"
+
           const quotaUnavailable = (why) => {
             out.windows.push({ name: 'AI credits', aside: true, text: true, display: why });
           };
           // 进度条窗口：credits 与核时的字段完全一致，只有名字与单位不同
-          const progressWindow = (name, unit, d) => ({
+          // dead：余额为 0 时在文字最前面加"已用尽"——额度的事只在额度行说，
+          // workspace 行不再重复（见 workspaceLine）。
+          const progressWindow = (name, unit, d, dead = false) => ({
             name,
             // used 是**百分比 0-100**，不是已用量。它同时是进度条的开关：
             // 不给这个字段，宿主认为窗口"没有读数"，只渲染文字不画进度条。
@@ -2248,8 +2246,9 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             amount: round1(d.used ?? 0),
             limit: round1(d.total),
             unit,
-            // 文字只补进度条看不出来的：特权 · 冻结 · 可用
+            // 文字只补进度条看不出来的：已用尽 · 特权 · 冻结 · 可用
             display: [
+              dead ? '已用尽' : null,
               bonusPart(d.bonus, d.bonusDesc, d.bonusExpire, d.bonusExpired),
               `冻结 ${num1(d.frozen)}`,
               `可用 ${num1(d.remain)}`,
@@ -2266,7 +2265,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               // 这里先记下结论，等窗口都拼好了再回来改写那一行。
               creditDead = q?.credit?.remain != null && q.credit.remain <= 0;
               if (q?.credit && q.credit.used != null) {
-                out.windows.push(progressWindow('AI credits', 'cr', q.credit));
+                out.windows.push(progressWindow('AI credits', 'cr', q.credit, creditDead));
               } else if (q?.credit) {
                 // 总额拿到了、已用量没拿到（volume 单独失败）：能显示就别空着
                 const c = q.credit;
@@ -2274,7 +2273,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
                   name: 'AI credits',
                   aside: true,
                   text: true,
-                  display: `可用 ${num1(c.remain)} / ${num1(c.total)} cr · 已用量未取到`
+                  display: `${c.remain != null && c.remain <= 0 ? '已用尽 · ' : ''}`
+                    + `可用 ${num1(c.remain)} / ${num1(c.total)} cr · 已用量未取到`
                     + (q.errors?.length ? `（${q.errors[0]}）` : ''),
                 });
               } else {
