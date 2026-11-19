@@ -22,6 +22,13 @@ const cnbHeaders = (token, extra) => ({
   ...(extra || {}),
 });
 
+// 不经过 cfg 的 CNB 请求。登录阶段还没有"当前账号"，只能用调用方给的 token；
+// 有了账号之后走闭包里的 api()，那里才带得到 cfg.token 和 403 的权限翻译。
+const cnbGet = (token, path, ms = 15000) => fetch(`${CNB_API}${path}`, {
+  headers: cnbHeaders(token),
+  signal: AbortSignal.timeout(ms),
+});
+
 // 插件在 plugins.json / `magpie plugin options` 里用的标识
 const PLUGIN_ID = 'magpie-cnb2api';
 
@@ -309,6 +316,11 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   // 组织与仓库之间固定用 "/"（CNB 自己的写法，org/repo）。
   //
   // 粒度取到仓库 —— 同组织下两个仓库是两个账号，只写用户名或组织都分不出来。
+  //
+  // ⚠️ 这个字符串同时是 magpie 的持久化键（usage 的 user → quotas.json、
+  // quota-history.json、providers.json 的 accountNames），所以**不能截断**：
+  // 两个仓库名共享前缀时会被截成同一个键，账号就并成一个了。格式一旦定下
+  // 也不要再改，改了等于凭空多出一批"新账号"（旧键留在宿主缓存里）。
   function labelOf(auth, ctx) {
     const meta = auth?.metadata || {};
     const name = String(meta.username || '').trim();
@@ -316,10 +328,9 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     // 没有 username 时直接用它，不能再拼一次 repo，否则会重复一截。
     const fromEmail = String(meta.email || '').replace(/@cnb\.cool$/i, '').trim();
     const repo = String(meta.repo || '').trim();
-    const label = repo && name
+    return repo && name
       ? `${name} | ${repo}`
       : (name || fromEmail || auth?.label || ctx?.key || '');
-    return label.slice(0, 48);
   }
 
   // 仓库：登录时必选，地址和账号区分都按它算。
@@ -433,15 +444,18 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   // ---------- OpenAPI ----------
   async function api(path, init = {}) {
     if (!cfg.token) throw new Error('尚未填写 CNB 访问令牌');
+    // timeout 是本函数的私有参数：直接 spread 进 fetch 既不生效也不报错，
+    // 只会让人以为超时被设上了。调用方自带 signal 时也不该被覆盖。
+    const { timeout, signal, ...rest } = init;
     const res = await fetch(`${CNB_API}${path}`, {
-      ...init,
+      ...rest,
       headers: {
         Authorization: `Bearer ${cfg.token}`,
         Accept: 'application/json',
         ...(init.body ? { 'Content-Type': 'application/json' } : {}),
         ...(init.headers || {}),
       },
-      signal: AbortSignal.timeout(init.timeout || 20000),
+      signal: signal || AbortSignal.timeout(timeout || 20000),
     });
     if (!res.ok) {
       const body = await res.text().catch(() => '');
@@ -590,8 +604,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
 
     const q = await charge(org, 8000).catch(() => null);
     const c = q?.credit;
-    // remainMilli 已经是 max(0, 总额 - 已用 - 冻结)，等于 0 就真没得用了
-    const blocked = c && c.remainMilli != null && c.remainMilli <= 0
+    // remain 已经是 max(0, 总额 - 已用 - 冻结)，等于 0 就真没得用了
+    const blocked = c && c.remain != null && c.remain <= 0
       ? { org, message: quotaBlockMessage(c), credit: c }
       : null;
     state.quotaGate = { org, at: Date.now(), blocked };
@@ -843,13 +857,20 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return true;
   }
 
+  // "现在能不能用"的判据：有地址 **且** 工作区在跑。
+  //
+  // 只看 state.uri 是不够的：工作区被平台停掉后 refresh 只改 sn/status，
+  // uri 仍是上一次的地址。拿它当就绪，waitForReady 第一轮就返回 true，
+  // 重试照样打到已经断掉的地址上 —— "检测到停止后等它重启"就等于白等。
+  const isReady = () => !!state.uri && state.status === 'running';
+
   // 有界等待：轮询直到拿到可用地址。用于首请求和"检测到停止"之后，
   // 因为工作区从 start 到代理监听 9001 通常需要 30~90 秒。
   async function waitForReady(budgetMs) {
     const deadline = Date.now() + budgetMs;
     while (Date.now() < deadline) {
       await refresh('wait');
-      if (state.uri) return true;
+      if (isReady()) return true;
       // token 无效 / 权限不足是确定性的，再等也不会好，立即放弃
       if (state.fatal) return false;
       // 额度用尽同理：工作区根本没被拉起，再等也等不出地址
@@ -858,7 +879,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       if (left <= 0) break;
       await new Promise((r) => setTimeout(r, Math.min(6000, left)));
     }
-    if (!state.uri) warn(`等待 ${Math.round(budgetMs / 1000)}s 后仍无可用地址 · ${state.lastError || '原因未知'}`);
+    if (!isReady()) warn(`等待 ${Math.round(budgetMs / 1000)}s 后仍无可用地址 · ${state.lastError || '原因未知'}`);
     return false;
   }
 
@@ -951,6 +972,38 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     };
   }
 
+  // 额度三元组（总额 / 已用 / 冻结 / 特权）的通用算法。
+  //
+  // credits 和核时的字段口径完全一致，只是一个以 milli 计、一个以秒计。
+  // 两段一模一样的算式以前是复制粘贴的，改一处忘一处就会让面板上两个
+  // 窗口的数字对不上，所以合成一个。
+  //
+  // scale = 1 个显示单位对应多少原始单位（credits 1000、核时 3600）。
+  // pre   = 特权注解（specialOf 的返回值），null 表示没有特权。
+  // 返回 null 表示总额没拿到，调用方就不显示这一项。
+  function bucket(total, used, frozen, pre, scale) {
+    if (total == null) return null;
+    // 关键：total 已经包含特权，基础额度必须减掉特权，否则 666 会被算两次
+    const specialRaw = pre?.amount != null ? pre.amount * scale : null;
+    const baseRaw = specialRaw != null ? total - specialRaw : total;
+    // 可用 = 总额 - 已用 - 冻结；明明超了也要显示 0，不能出现负数
+    const remainRaw = Math.max(0, total - (used || 0) - frozen);
+    return {
+      total: total / scale,
+      used: used != null ? used / scale : null,
+      frozen: frozen / scale,
+      bonus: pre?.amount ?? null,
+      base: baseRaw / scale,
+      remain: remainRaw / scale,
+      // 已用率 / 已用+冻结率，都基于总额（不是基础额度）算
+      usedPct: used != null ? (used / total) * 100 : null,
+      usedFrozenPct: total > 0 ? ((used || 0) + frozen) / total * 100 : null,
+      bonusDesc: pre?.desc ?? null,
+      bonusExpire: pre?.expire ?? null,
+      bonusExpired: pre?.expired ?? false,
+    };
+  }
+
   // timeoutMs 给调用方决定：界面钩子等不起 20 秒，后台巡检可以慢慢来。
   // 失败原因收集在 errors 里 —— 静默吞掉的话，面板上只会显示"查不到额度"，
   // 谁也看不出是缺权限、超时，还是组织填错了。
@@ -970,88 +1023,30 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     ]);
     if (!quota && !volume) return { errors };
 
-    const res = { errors };
+    const res = {};
+    // special.credit 的单位是 credit（不是 milli），由 scale 换算
+    const credit = bucket(
+      num(quota?.credit_in_milli),
+      num(volume?.credit_in_milli),
+      num(volume?.freeze_credit_in_milli) || 0,
+      specialOf(special, 'credit', 1),
+      1000,
+    );
+    if (credit) res.credit = credit;
 
-    // ---- credits ----
-    // 统一在 milli 口径上算，最后再 /1000 显示，避免中间反复换算丢精度。
-    const totalMilli = num(quota?.credit_in_milli);          // 总额（已含特权）
-    const usedMilli = num(volume?.credit_in_milli);          // 已用
-    const frozenMilli = num(volume?.freeze_credit_in_milli) || 0;   // 冻结
-    // special.credit 单位是 credit，不是 milli —— 要 ×1000 统一口径
-    const bonus = specialOf(special, 'credit', 1);
-    const specialMilli = bonus?.amount != null ? bonus.amount * 1000 : null;
+    // 核时的特权字段叫 compute_develop_corehour，说明和过期时间却叫
+    // compute_develop_desc / _expire（少一截），baseKey 就是为这个传的
+    const dev = bucket(
+      num(quota?.dev_in_sec),
+      num(volume?.dev_in_sec),
+      num(volume?.freeze_dev_in_sec) || 0,
+      specialOf(special, 'compute_develop_corehour', 1, 'compute_develop'),
+      3600,
+    );
+    if (dev) res.devHours = dev;
 
-    if (totalMilli != null) {
-      // 关键：total 已经包含特权，所以基础额度必须减去特权，
-      // 否则会把 666 重复计算一次。
-      const baseMilli = specialMilli != null ? totalMilli - specialMilli : totalMilli;
-      // 可用 = 总额 - 已用 - 冻结，下限 0
-      const remainMilli = Math.max(0, totalMilli - (usedMilli || 0) - frozenMilli);
-      // 已用率 / 已用+冻结率，基于总额（不是基础额度）算
-      const usedPct = usedMilli != null ? (usedMilli / totalMilli) * 100 : null;
-      const usedFrozenPct = totalMilli > 0
-        ? ((usedMilli || 0) + frozenMilli) / totalMilli * 100
-        : null;
-
-      res.credit = {
-        totalMilli,
-        usedMilli,
-        frozenMilli,
-        specialMilli,
-        baseMilli,
-        remainMilli,
-        usedPct,
-        usedFrozenPct,
-        total: totalMilli / 1000,
-        used: usedMilli != null ? usedMilli / 1000 : null,
-        frozen: frozenMilli / 1000,
-        bonus: bonus?.amount ?? null,
-        base: baseMilli / 1000,
-        remain: remainMilli / 1000,
-        bonusDesc: bonus?.desc ?? null,
-        bonusExpire: bonus?.expire ?? null,
-        bonusExpired: bonus?.expired ?? false,
-        // 接口自己的"免费额度"，用于交叉验证 base 口径
-        freeMilli: num(quota?.credit_in_milli?.free),
-      };
-    }
-
-    // ---- 核时（同口径）----
-    const devTotalSec = num(quota?.dev_in_sec);
-    const devUsedSec = num(volume?.dev_in_sec);
-    const devFrozenSec = num(volume?.freeze_dev_in_sec) || 0;
-    // compute_develop_corehour 的说明字段是 compute_develop_desc（没有 _corehour）
-    const devBonus = specialOf(special, 'compute_develop_corehour', 1, 'compute_develop');
-    const devSpecialSec = devBonus?.amount != null ? devBonus.amount * 3600 : null;
-
-    if (devTotalSec != null) {
-      const baseSec = devSpecialSec != null ? devTotalSec - devSpecialSec : devTotalSec;
-      const remainSec = Math.max(0, devTotalSec - (devUsedSec || 0) - devFrozenSec);
-      res.devHours = {
-        totalSec: devTotalSec,
-        usedSec: devUsedSec,
-        frozenSec: devFrozenSec,
-        specialSec: devSpecialSec,
-        baseSec,
-        remainSec,
-        usedPct: devUsedSec != null ? (devUsedSec / devTotalSec) * 100 : null,
-        usedFrozenPct: devTotalSec > 0
-          ? ((devUsedSec || 0) + devFrozenSec) / devTotalSec * 100
-          : null,
-        total: devTotalSec / 3600,
-        used: devUsedSec != null ? devUsedSec / 3600 : null,
-        frozen: devFrozenSec / 3600,
-        bonus: devBonus?.amount ?? null,
-        base: baseSec / 3600,
-        remain: remainSec / 3600,
-        bonusDesc: devBonus?.desc ?? null,
-        bonusExpire: devBonus?.expire ?? null,
-        bonusExpired: devBonus?.expired ?? false,
-      };
-    }
     // 全成功时不留空数组，免得调用方以为有错
-    if (!errors.length) delete res.errors;
-    return res;
+    return errors.length ? { ...res, errors } : res;
   }
 
   // 面板展示用的一层短缓存：额度面板可能被频繁读（打开面板、每次请求后
@@ -1078,12 +1073,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     if (!h) return '';
     // cnb.run 的子域形如 <12位随机>-<端口>.<域名>
     const m = h.match(/^([^-]+)-(\d+\..+)$/);
-    if (m) {
-      const [, sub, rest] = m;
-      const head = sub.slice(0, 4);
-      const tail = rest;                       // 端口 + 域名原样保留
-      return sub.length <= 6 ? `${head}****-${tail}` : `${head}****-${tail}`;
-    }
+    // 端口与域名原样保留：看得出是不是 9001、是不是 cnb.run
+    if (m) return `${m[1].slice(0, 4)}****-${m[2]}`;
     // 其他形态：保留前 4 后 4，中间打码
     if (h.length <= 10) return h;
     return `${h.slice(0, 4)}****${h.slice(-4)}`;
@@ -1130,10 +1121,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     const now = Date.now();
     const hit = repoCacheByToken.get(fp(token));
     if (hit && now - hit.at < 60_000) return hit.repos;
-    const res = await fetch(`${CNB_API}/user/repos?page=1&page_size=100`, {
-      headers: cnbHeaders(token),
-      signal: AbortSignal.timeout(15000),
-    });
+    const res = await cnbGet(token, '/user/repos?page=1&page_size=100');
     if (!res.ok) return null;
     const j = await res.json();
     const items = Array.isArray(j) ? j : (j?.list || []);
@@ -1155,7 +1143,6 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     if (hit && now - hit.at < 60_000) return hit.orgs;
 
     const orgs = new Set();
-    const head = cnbHeaders(token);
 
     const repos = await listReposForLogin(token).catch(() => null);
     for (const p of (repos || [])) {
@@ -1164,7 +1151,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     }
 
     try {
-      const me = await fetch(`${CNB_API}/user`, { headers: head, signal: AbortSignal.timeout(12000) });
+      const me = await cnbGet(token, '/user', 12000);
       if (me.ok) {
         const u = await me.json();
         if (u?.username) orgs.add(u.username);
@@ -1172,9 +1159,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     } catch { /* 忽略 */ }
 
     try {
-      const g = await fetch(`${CNB_API}/user/groups?page=1&page_size=50`, {
-        headers: head, signal: AbortSignal.timeout(12000),
-      });
+      const g = await cnbGet(token, '/user/groups?page=1&page_size=50', 12000);
       if (g.ok) {
         const j = await g.json();
         for (const x of (Array.isArray(j) ? j : (j?.list || []))) {
@@ -1195,10 +1180,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   // 注意：workspace/list 的 slug 参数只认完整的 org/repo，
   // 传单个组织名（slug=alice）会返回 0 条。所以这里拉全量再本地过滤。
   async function listCnbReposForLogin(token, org) {
-    const res = await fetch(`${CNB_API}/workspace/list?page=1&page_size=100`, {
-      headers: cnbHeaders(token),
-      signal: AbortSignal.timeout(20000),
-    }).catch(() => null);
+    const res = await cnbGet(token, '/workspace/list?page=1&page_size=100', 20000).catch(() => null);
 
     let list = [];
     if (res?.ok) {
@@ -1213,9 +1195,9 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     const byRepo = new Map();
     for (const w of list) {
       const slug = w.slug || w.repo_url;
-      const cur = byRepo.get(slug);
+      const hit = byRepo.get(slug);
       const running = w.status === 'running';
-      if (!cur || (running && !cur.running)) byRepo.set(slug, { slug, sn: w.sn, running });
+      if (!hit || (running && !hit.running)) byRepo.set(slug, { slug, sn: w.sn, running });
     }
 
     const out = [];
@@ -1226,10 +1208,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         continue;
       }
       try {
-        const r = await fetch(
-          `${CNB_API}/${w.slug}/-/build/runner/download/log/${encodeURIComponent(w.sn)}-001`,
-          { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(15000) },
-        );
+        const r = await cnbGet(token, `/${w.slug}/-/build/runner/download/log/${encodeURIComponent(w.sn)}-001`);
         if (r.ok && pickUriFromLog(await r.text(), defaultCfg.port)) {
           out.push({ repo: w.slug, running: w.running });
         }
@@ -1368,6 +1347,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       state.quotaGate = null;
       state.quotaBlocked = null;
       state.startAt = 0;
+      // 权限自检是针对"上一把令牌"的结论，换令牌后要重新探一遍
+      state.reported = false;
       // 定时器保留（周期没变），但立刻触发一轮
       if (state.timer) state.readyPromise = tick(cur()).catch(() => {});
     } else {
@@ -1830,10 +1811,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             // 多个账号可能填同一个 proxyKey（同一份 .cnb.yml），所以要给出独立的标识。
             let me = null;
             try {
-              const res = await fetch(`${CNB_API}/workspace/list?page=1&page_size=1`, {
-                headers: cnbHeaders(token),
-                signal: AbortSignal.timeout(15000),
-              });
+              const res = await cnbGet(token, '/workspace/list?page=1&page_size=1');
               if (res.status === 401) {
                 return {
                   type: 'failed',
@@ -1855,10 +1833,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
 
             // /user 拿不到也不致命，但拿不到就没法保证账号唯一性
             try {
-              const u = await fetch(`${CNB_API}/user`, {
-                headers: cnbHeaders(token),
-                signal: AbortSignal.timeout(12000),
-              });
+              const u = await cnbGet(token, '/user', 12000);
               if (u.ok) me = await u.json();
             } catch { /* 忽略 */ }
 
@@ -2038,14 +2013,21 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
 
             // input 是完整 URL（magpie 已用 baseURL + 路径拼好）。
             // 不管 magpie 存下的是哪个 baseURL，都改写成当前真实地址。
+            const sourceUrl = String(input instanceof Request ? input.url : input);
             const target = () => {
-              const s = String(input instanceof Request ? input.url : input);
               if (!state.uri) return null;
-              return s.replace(/^https?:\/\/[^/?#]+/, state.uri);
+              return sourceUrl.replace(/^https?:\/\/[^/?#]+/, state.uri);
             };
-            const send = (url) => (url === String(input instanceof Request ? input.url : input))
-              ? fetch(input, init)                       // 没变就原样发，保留 Request 语义
-              : fetch(url, init);
+            // 换地址重发时：input 是 Request 的话，method/body/headers 都在
+            // Request 自身里，只拿 URL 字符串发会把 POST 悄悄变成 GET。
+            // 用 new Request(url, input) 克隆过去才保得住（body 已被读过时退化）。
+            const send = (url) => {
+              if (url === sourceUrl) return fetch(input, init);   // 没变就原样发
+              if (input instanceof Request) {
+                try { return fetch(new Request(url, input)); } catch { /* body 已消费 */ }
+              }
+              return fetch(url, init);
+            };
 
             const first = target();
             try {
@@ -2113,22 +2095,10 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         // 或只在界面上看额度而不发消息），缺少这步 cfg.token 就是空的。
         applyCredentials(auth);
 
-        // 账号在界面上的名字。格式 "用户 | 组织/仓库"：粒度到仓库，
-        // 同组织下两个仓库是两个账号，只写用户名或只写组织都分不开。
+        // 账号名。与日志前缀共用一套规则（labelOf），不在这里重算一遍：
+        // 这个名字同时是 magpie 的持久化键，两处实现一旦分叉就会多出一批孤儿键。
         // 不返回 user 的话宿主要拿 key 尾缀当名字（"API key …-key"）。
-        //
-        // ⚠️ 这个字符串不只是显示名：magpie 拿它当持久化键，写进
-        // quotas.json / quota-history.json / providers.json 的 accountNames。
-        // 所以格式一旦定下就不要再改 —— 改了等于多出一个"新账号"，
-        // 旧键会永远留在宿主的缓存里（tools/magpie-prune.mjs 可清）。
-        const userName = String(auth?.metadata?.username || '').trim();
-        const authRepo = String(auth?.metadata?.repo || '').trim();
-        // email 已经是 "用户 | 组织/仓库"（去掉 @cnb.cool），没有 username
-        // 时直接用，别再把 repo 拼一次
-        const fromEmail = String(auth?.metadata?.email || '').replace(/@cnb\.cool$/i, '').trim();
-        const accountName = userName
-          ? (authRepo ? `${userName} | ${authRepo}` : userName)
-          : fromEmail;
+        const accountName = labelOf(auth, ctx);
         // usage 是界面钩子，**宿主等不起冷启动**：工作区停着时调 start 要
         // 1~10 秒，探一个不通的地址要好几秒 —— 一旦在这里同步等，额度面板
         // 就是一片空白，用户看到的就是"无法获取额度"。
@@ -2194,6 +2164,23 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         const quotaUnavailable = (why) => {
           out.windows.push({ name: 'AI credits', aside: true, text: true, display: why });
         };
+        // 进度条窗口：credits 与核时的字段完全一致，只有名字与单位不同
+        const progressWindow = (name, unit, d) => ({
+          name,
+          // used 是**百分比 0-100**，不是已用量。它同时是进度条的开关：
+          // 不给这个字段，宿主认为窗口"没有读数"，只渲染文字不画进度条。
+          used: d.usedPct != null ? Math.min(100, Math.max(0, round1(d.usedPct))) : 0,
+          // amount/limit/unit：进度条上的数字（已用/总额 + 单位）
+          amount: round1(d.used ?? 0),
+          limit: round1(d.total),
+          unit,
+          // 文字只补进度条看不出来的：特权 · 冻结 · 可用
+          display: [
+            bonusPart(d.bonus, d.bonusDesc, d.bonusExpire, d.bonusExpired),
+            `冻结 ${num1(d.frozen)}`,
+            `可用 ${num1(d.remain)}`,
+          ].filter(Boolean).join(' · '),
+        });
         if (!org || !cfg.token) {
           quotaUnavailable(!cfg.token ? '查不到 · 尚未读取到 CNB 访问令牌' : '查不到 · 仓库未确定');
         } else {
@@ -2201,24 +2188,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             // 界面钩子等不起：4 秒拿不到就照实报"超时"，不拖住整个面板
             const q = await chargeForUsage(org);
             if (q?.credit && q.credit.used != null) {
-              const c = q.credit;
-              out.windows.push({
-                name: 'AI credits',
-                // used 是**百分比 0-100**，不是已用量。
-                // 它是进度条的开关：不给这个字段，宿主认为窗口"没有读数"，
-                // 只渲染文字而不画进度条。
-                used: c.usedPct != null ? Math.min(100, Math.max(0, round1(c.usedPct))) : 0,
-                // amount/limit/unit：进度条上的数字（已用/总额 + 单位）
-                amount: round1(c.used ?? 0),
-                limit: round1(c.total),
-                unit: 'cr',
-                // 文字只补进度条看不出来的：特权 · 冻结 · 可用
-                display: [
-                  bonusPart(c.bonus, c.bonusDesc, c.bonusExpire, c.bonusExpired),
-                  `冻结 ${num1(c.frozen)}`,
-                  `可用 ${num1(c.remain)}`,
-                ].filter(Boolean).join(' · '),
-              });
+              out.windows.push(progressWindow('AI credits', 'cr', q.credit));
             } else if (q?.credit) {
               // 总额拿到了、已用量没拿到（volume 单独失败）：能显示就别空着
               const c = q.credit;
@@ -2233,19 +2203,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               quotaUnavailable(`查不到 · ${q?.errors?.[0] || '令牌可能缺少 group-resource:r'}`);
             }
             if (q?.devHours && q.devHours.used != null) {
-              const d = q.devHours;
-              out.windows.push({
-                name: 'dev core-hours',
-                used: d.usedPct != null ? Math.min(100, Math.max(0, round1(d.usedPct))) : 0,
-                amount: round1(d.used ?? 0),
-                limit: round1(d.total),
-                unit: 'h',
-                display: [
-                  bonusPart(d.bonus, d.bonusDesc, d.bonusExpire, d.bonusExpired),
-                  `冻结 ${num1(d.frozen)}`,
-                  `可用 ${num1(d.remain)}`,
-                ].filter(Boolean).join(' · '),
-              });
+              out.windows.push(progressWindow('dev core-hours', 'h', q.devHours));
             }
           } catch (e) {
             out.error = `额度查询失败 · ${e.message}`;
