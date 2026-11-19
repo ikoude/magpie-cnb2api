@@ -2256,14 +2256,15 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           const host = state.uri ? hostOf(state.uri) : '';
           //
           // 顺序即版面：账号卡的额度行（.acc .aq）是**一行** flex 容器，
-          // 只排前两个窗口，其余只进悬停提示。workspace 曾经排第一，于是
-          // 额度被挤到同一行右侧，读起来像"工作区状态 + 额度"挤在一起。
-          // 现在额度先排，workspace 和它的补充说明排到最后：那一行就是
-          // 额度行，工作区状态由账号名后的 plan 徽标与悬停提示给出。
+          // 只排前两个窗口，其余只进悬停提示。所以前两位必须是用户最想看的两条：
+          // workspace（在不在、地址通不通）与 AI credits（还剩多少）。
+          // dev core-hours 排到后面去——核时几乎不会先耗尽，天天占着第二行
+          // 反而把工作区状态挤进悬停提示。宽屏放不下时 flex 自己换行。
           const wsRow = { name: 'workspace', aside: true, display: '' };
           out.windows = [];
-          const later = [];         // 不占额度行的窗口：补充说明 + workspace
-          const details = [];       // 明细排在两个额度之后，免得占掉第二个位置
+          const later = [];         // 不占前两位的补充说明
+          const devLater = [];      // dev core-hours：数据保留，只进悬停提示
+          const details = [];       // 明细垫在最后
 
           // 1b) 自动重启状态：权限不够时明确告诉用户"能跟随但不会重启"
           if (cfg.autoStart && state.status !== 'running' && state.autoStartBlocked) {
@@ -2342,7 +2343,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
                 quotaUnavailable(`查不到 · ${q?.errors?.[0] || '令牌可能缺少 group-resource:r'}`);
               }
               if (q?.devHours && q.devHours.used != null) {
-                out.windows.push(progressWindow('dev core-hours', 'h', q.devHours));
+                devLater.push(progressWindow('dev core-hours', 'h', q.devHours));
                 details.push(detailWindow('dev core-hours', 'h', q.devHours));
               }
             } catch (e) {
@@ -2363,10 +2364,10 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           if (process.env.CNB2API_SHOW_FULL_HOST === '1' && alive && host) {
             wsRow.display = wsRow.display.replace(maskHost(host), host);
           }
-          // 版面收尾：两个额度 → 补充说明 → workspace → 明细。
-          // 面板额度行（前两个）因此是"AI credits · dev core-hours"，
-          // 工作区状态不再和额度抢同一行；终端里状态也紧跟额度，明细垫后。
-          out.windows.push(...later, wsRow, ...details);
+          // 版面收尾：workspace → AI credits → 补充说明 → dev core-hours → 明细。
+          // 前两位是面板那两行（工作区状态、credits），核时与明细不进可视区，
+          // 但仍随 /quotas 返回，终端 magpie quota 与悬停提示照旧能读到。
+          out.windows = [wsRow, ...out.windows, ...later, ...devLater, ...details];
           return out;
         });
       },
