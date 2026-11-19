@@ -2246,9 +2246,13 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             amount: round1(d.used ?? 0),
             limit: round1(d.total),
             unit,
-            // 文字只补进度条看不出来的：已用尽 · 特权 · 冻结 · 可用
+            // 文字要能独立读懂：面板与 TTY 只渲染百分比 + 这段文字，
+            // amount/limit 不进文本，光有 "100%" 看不出到底多少额度。
+            // 所以这里自带 "已用 x / y 单位"；余额为 0 时它等价于 "已用尽"，不再重复写。
             display: [
-              dead ? '已用尽' : null,
+              dead
+                ? `已用尽 · ${num1(d.used)} / ${num1(d.total)} ${unit}`
+                : `已用 ${num1(d.used)} / ${num1(d.total)} ${unit}`,
               bonusPart(d.bonus, d.bonusDesc, d.bonusExpire, d.bonusExpired),
               `冻结 ${num1(d.frozen)}`,
               `可用 ${num1(d.remain)}`,
