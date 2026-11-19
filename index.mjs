@@ -121,66 +121,66 @@ const PERMISSIONS = [
     scope: 'repo-cnb-trigger:r',
     need: 'required',
     label: '读流水线日志',
-    why: '上游地址只能从工作区启动日志里的 PROXY_URI= 拿到，这是唯一的地址来源。',
+    why: '工作区地址仅能从启动日志的 PROXY_URI= 行获取，这是唯一的地址来源。',
     endpoint: 'GET /{repo}/-/build/runner/download/log/{pipelineId}',
-    missing: '拿不到地址，插件完全不可用',
+    missing: '无法获取地址，插件不可用',
   },
   {
     scope: 'account-engage:r',
     need: 'required',
-    label: '列自己的工作区',
-    why: '先要知道有哪些工作区、哪个在 running，才能去读它的日志。',
+    label: '列出工作区',
+    why: '需要先获取工作区列表与运行状态，才能读取对应日志。',
     endpoint: 'GET /workspace/list',
-    missing: '不知道工作区存在，插件完全不可用',
+    missing: '无法获取工作区，插件不可用',
   },
   {
     scope: 'repo-cnb-trigger:rw',
     need: 'required-for-autostart',
-    label: '拉起工作区',
-    why: '工作区被平台回收后自动重新启动。不勾这项只能跟随地址，不能自动重启。',
+    label: '启动工作区',
+    why: '工作区被平台回收后自动启动。未勾选时仅能跟随地址，无法自动重启。',
     endpoint: 'POST /{repo}/-/workspace/start',
-    missing: '工作区停了要手动去 CNB 点启动',
+    missing: '工作区停止后需在 CNB 手动启动',
   },
   {
     scope: 'repo-cnb-detail:r',
     need: 'optional',
     label: '工作区详情',
-    why: '比拉整份日志快，作为取地址的备用路径（目前 CNB 返回的字段不含 cnb.run，基本用不上）。',
+    why: '作为获取地址的备用路径，比读取完整日志更快；当前 CNB 返回的字段不含 cnb.run，通常不使用。',
     endpoint: 'GET /{repo}/-/workspace/detail/{sn}',
-    missing: '无影响，自动回退到读日志',
+    missing: '无影响 · 自动回退到读取日志',
   },
   {
     scope: 'group-resource:r',
     need: 'optional',
     label: '组织额度',
-    why: '让 magpie quota 显示真实 AI credits 与核时消耗。',
+    why: '在 magpie quota 中显示真实 AI credits 与核时消耗。',
     endpoint: 'GET /{slug}/-/charge/quota、/volume',
-    missing: 'quota 里不显示额度，其他功能正常',
+    missing: 'quota 中不显示额度 · 其他功能正常',
   },
   {
     scope: 'repo-cnb-history:r',
     need: 'optional',
     label: 'AI 用量明细',
-    why: '按模型统计 token 与 credit，排查异常消耗时有用。',
+    why: '按模型统计 token 与 credit，用于排查异常消耗。',
     endpoint: 'GET /{repo}/-/build/logs/ai-request/...',
     missing: '无影响',
   },
   {
     scope: 'repo-code:r',
     need: 'not-needed',
-    label: '读仓库代码（插件不用）',
-    why: '这是直连 /{repo}/-/ai/chat/completions 的条件。但上游有客户端指纹校验，'
-      + '直连会被 11128 拦截，cnb2api 内部的 neutralize 才处理得了它。',
+    label: '读取仓库代码（插件不使用）',
+    why: '直连 /{repo}/-/ai/chat/completions 需要该权限；但上游存在客户端指纹校验，'
+      + '直连请求会被 11128 拦截，仅 cnb2api 内部的 neutralize 可处理。',
     endpoint: 'POST /{repo}/-/ai/chat/completions',
-    missing: '无影响。不建议为它开权限',
+    missing: '无影响 · 不建议为此开启权限',
   },
 ];
 
 const NEED_CN = {
   required: '必需',
-  'required-for-autostart': '要自动重启才必需',
+  'required-for-autostart': '自动重启时必需',
   optional: '可选',
-  'not-needed': '插件用不到',
+  'not-needed': '插件不使用',
 };
 
 // 带 scope 信息的错误：上层可以据此决定"是降级继续"还是"彻底失败"
@@ -203,8 +203,8 @@ function explainScope(errText) {
   if (!known.length) return { missing, lines: [] };
   return {
     missing,
-    lines: known.map((p) => `缺 ${p.scope}（${p.label}，${NEED_CN[p.need]}）：${p.missing}`),
-    action: 'CNB → 头像 → 访问令牌 → 编辑，勾上上述权限后重启工作区',
+    lines: known.map((p) => `缺少 ${p.scope}（${p.label} · ${NEED_CN[p.need]}）：${p.missing}`),
+    action: '在 CNB → 头像 → 访问令牌 → 编辑 中勾选上述权限后重启工作区',
   };
 }
 
@@ -376,7 +376,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   async function forEachAccount(fn) {
     const all = [...ctxs.values()];
     if (!all.length) {
-      return '还没有登录任何 CNB 账号。执行 magpie plugin login cnb2api 添加。';
+      return '尚未登录任何 CNB 账号 · 执行 magpie plugin login cnb2api 添加';
     }
     const multi = all.length > 1;
     const blocks = await Promise.all(all.map(async (ctx) => {
@@ -386,7 +386,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           await refresh('tool').catch(() => {});
         }
         return fn(ctx);
-      }).catch((e) => [`执行失败：${e.message}`]);
+      }).catch((e) => [`执行失败 · ${e.message}`]);
       const head = multi ? `【${ctx.label || ctx.key}】` : '';
       const body = Array.isArray(lines) ? lines : [String(lines)];
       return head ? [head, ...body.map((l) => `  ${l}`)].join('\n') : body.join('\n');
@@ -397,7 +397,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   // 取当前 ctx，没有就报错（说明有代码在账号作用域外碰了账号数据）
   function need() {
     const c = cur();
-    if (!c) throw new Error('内部错误：在账号作用域外访问账号数据');
+    if (!c) throw new Error('内部错误 · 在账号作用域外访问账号数据');
     return c;
   }
 
@@ -449,7 +449,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       if (res.status === 403) {
         const ex = explainScope(body);
         if (ex) {
-          const msg = [`权限不足：${path}`, ...ex.lines, ex.action ? `处理：${ex.action}` : '']
+          const msg = [`权限不足 · ${path}`, ...ex.lines, ex.action ? `处理方式 · ${ex.action}` : '']
             .filter(Boolean).join('；');
           throw new ScopeError(msg, ex.missing);
         }
@@ -466,7 +466,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       return '令牌无效或已过期';
     }
     if (/HTTP 404/.test(m) && /workspace/i.test(m)) {
-      return `仓库 ${cfg.repo} 下没有工作区`;
+      return `仓库 ${cfg.repo} 下无工作区`;
     }
     return m;
   }
@@ -572,7 +572,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     const used = c.used != null ? num1(c.used) : '?';
     const frozen = c.frozen ? `，冻结 ${num1(c.frozen)}` : '';
     return `AI credits 已用尽（已用 ${used} / ${num1(c.total)} cr${frozen}）`
-      + '· 没有拉起工作区，额度恢复后会自动再试';
+      + '· 未启动工作区 · 额度恢复后将自动重试';
   }
 
   // 返回 null = 可以拉；返回对象 = 用尽了，别拉。
@@ -625,24 +625,24 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       }
       state.quotaBlocked = null;
 
-      say('工作区未运行，正在拉起');
+      say('工作区未运行 · 正在启动');
       await api(`/${cfg.repo}/-/workspace/start`, {
         method: 'POST',
         body: JSON.stringify({ branch: cfg.branch }),
         timeout: 60000,
       });
       state.startAt = Date.now();
-      say('启动已提交，等待代理监听');
+      say('启动已提交 · 等待网关就绪');
       return true;
     } catch (e) {
       if (e?.permission) {
         // 不是致命错误：地址还能跟随，只是不会自动重启
         state.autoStartBlocked = true;
-        state.lastError = '无法自动拉起 · 令牌缺 repo-cnb-trigger:rw';
-        warn(`无法自动拉起，地址仍会跟随 · 补上 repo-cnb-trigger:rw 才能自动重启 · ${e.message}`);
+        state.lastError = '无法自动启动 · 缺少 repo-cnb-trigger:rw';
+        warn(`无法自动启动 · 地址仍会跟随 · 需补充 repo-cnb-trigger:rw 才能自动重启 · ${e.message}`);
       } else {
-        warn(`拉起失败 · ${e.message}`);
-        state.lastError = `拉起失败 · ${e.message}`;
+        warn(`启动失败 · ${e.message}`);
+        state.lastError = `启动失败 · ${e.message}`;
       }
       return false;
     } finally {
@@ -719,7 +719,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       const full = `${org}/${name}`;
       if (!slugs.size || slugs.has(full)) {
         cfg.repo = full;
-        say(`仓库只写了名字 ${name}，按 ${full} 处理`);
+        say(`仓库仅填写名称 ${name} · 按 ${full} 处理`);
         return true;
       }
     }
@@ -727,7 +727,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     // 实在判断不出来：用第一个组织兜底，让后面的检查给出明确报错
     if (owners.length) {
       cfg.repo = `${owners[0]}/${name}`;
-      say(`没在工作区列表里找到 ${name}，先按 ${cfg.repo} 试`);
+      say(`工作区列表中未找到 ${name} · 暂按 ${cfg.repo} 处理`);
       return true;
     }
     return false;
@@ -751,8 +751,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       const retryGapMs = 5 * 60_000;
       if (state.repoTried && Date.now() - (state.repoTriedAt || 0) < retryGapMs) {
         state.lastError = cfg.repo
-          ? `无法补全仓库 "${cfg.repo}"`
-          : '未配置 repo，且自动发现失败（稍后重试）';
+          ? `无法补全仓库 ${cfg.repo}`
+          : '未配置 repo 且自动发现失败 · 稍后重试';
         return state;
       }
       state.repoTried = true;
@@ -760,14 +760,14 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       try {
         const found = await discoverOnce();
         if (!found) {
-          state.lastError = '没能确定仓库：repo 留空且工作区里认不出 cnb2api，'
-            + '或只填了名字但补不出组织。请填成 org/repo';
+          state.lastError = '未能确定仓库 · repo 为空且无法从工作区识别 cnb2api，'
+            + '或仅填写名称而无法补全组织 · 请填写为 org/repo';
           // 不设 fatal：等一会儿可能就好了
           return state;
         }
         state.repoTried = false;
       } catch (e) {
-        state.lastError = `自动发现仓库失败：${humanize(e)}`;
+        state.lastError = `仓库自动发现失败 · ${humanize(e)}`;
         return state;
       }
     }
@@ -778,7 +778,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         state.status = 'none';
         // 先确认这个仓库到底存不存在：填错名字时不该反复尝试拉起
         if (!(await repoExists(cfg.repo))) {
-          state.lastError = `仓库 ${cfg.repo} 不存在（或你的 token 无权访问）`;
+          state.lastError = `仓库 ${cfg.repo} 不存在或令牌无权访问`;
           state.fatal = true;
           return state;
         }
@@ -792,7 +792,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       state.status = ws.status;
 
       if (ws.status !== 'running') {
-        state.lastError = `工作区已停止（sn=${ws.sn}）`;
+        state.lastError = '工作区已停止';
         if (cfg.autoStart) {
           // 拉开之后工作区要几十秒才真正就绪，同一次调用里先不等，
           // 只标记"正在等启动"，让 waitForReady 去轮询。
@@ -820,7 +820,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   async function resolveUri(sn) {
     const uri = (await uriFromDetail(sn)) || (await uriFromLog(sn));
     if (!uri) {
-      state.lastError = '取不到地址（工作区可能还在启动）';
+      state.lastError = '未获取到地址 · 工作区可能仍在启动';
       return false;
     }
 
@@ -834,7 +834,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     }
 
     if (!(await health(uri))) {
-      state.lastError = `地址尚未就绪：${uri}`;
+      state.lastError = `地址尚未就绪 · ${uri}`;
       state.failures += 1;
       return false;
     }
@@ -858,7 +858,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       if (left <= 0) break;
       await new Promise((r) => setTimeout(r, Math.min(6000, left)));
     }
-    if (!state.uri) warn(`等了 ${Math.round(budgetMs / 1000)}s 仍没拿到可用地址 · ${state.lastError || '原因未知'}`);
+    if (!state.uri) warn(`等待 ${Math.round(budgetMs / 1000)}s 后仍无可用地址 · ${state.lastError || '原因未知'}`);
     return false;
   }
 
@@ -914,9 +914,9 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
   //   没有加成     → 空字符串（不显示，别出现 "加成 +0" 这种噪音）
   function bonusPart(amount, desc, expire, expired) {
     if (amount == null) return '';
-    const label = desc || '加成';
+    const label = desc || '赠送';
     if (expired) return `${label} +${num1(amount)} 已过期`;
-    return expire ? `${label} +${num1(amount)}（${fmtDate(expire)} 到期）` : `${label} +${num1(amount)}`;
+    return expire ? `${label} +${num1(amount)} · 有效期至 ${fmtDate(expire)}` : `${label} +${num1(amount)}`;
   }
 
   // 加成本身可为 null / 0（没有特权的账号就是这样），要能区分「没有」和「不知道」
@@ -1249,11 +1249,11 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       // 这是「还没填」，不是「填错了」——指引必须是去填，而不是去改令牌
       state.fatal = true;
       state.lastError = '尚未填写 CNB 访问令牌';
-      warn('还没填 CNB 访问令牌。两种填法：\n'
-        + `  1. magpie plugin login cnb2api（推荐，可一次配好多个组织）\n`
+      warn('CNB 访问令牌未填写 · 两种填写方式：\n'
+        + `  1. magpie plugin login cnb2api（推荐 · 可一次配置多个组织）\n`
         + `  2. magpie plugin options ${PLUGIN_ID} '{"token":"<令牌>"}'\n`
-        + '也可以走 magpie 界面 → Plugins → CNB2API → Options。\n'
-        + `令牌需要这些权限：${PERMISSIONS.filter((p) => p.need === 'required').map((p) => p.scope).join('、')}`);
+        + '也可在 magpie 界面 → Plugins → CNB2API → Options 中填写。\n'
+        + `令牌需要以下权限：${PERMISSIONS.filter((p) => p.need === 'required').map((p) => p.scope).join('、')}`);
       return;
     }
 
@@ -1297,11 +1297,11 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     const missingReq = req.filter((s) => lacking.includes(s));
 
     if (missingReq.length) {
-      warn(`缺少必需权限 ${missingReq.join('、')} · 拿不到地址，插件无法工作。`
-        + '去 CNB 头像 → 访问令牌 → 编辑，勾上后重启工作区。');
+      warn(`缺少必需权限：${missingReq.join('、')} · 无法获取地址，插件不可用`
+        + ' · 请在 CNB 头像 → 访问令牌 → 编辑 中勾选后重启工作区');
     } else if (lacking.length) {
       const optional = lacking.filter((s) => !req.includes(s));
-      warn(`缺少可选权限 ${optional.join('、')} · 只影响对应功能，核心功能照常。`
+      warn(`缺少可选权限：${optional.join('、')} · 仅影响对应功能，核心功能不受影响`
         + optional.map((s) => {
           const p = PERMISSIONS.find((x) => x.scope === s);
           return p ? `${s}（${p.label}）：${p.missing}` : s;
@@ -1319,9 +1319,9 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     } catch (e) {
       if (e?.permission) return { ok: true };              // 403：token 有效，只是权限不够
       if (/HTTP 401/.test(e?.message || '')) {
-        return { ok: false, reason: '令牌无效或已过期（401）——请到 CNB 重新生成访问令牌' };
+        return { ok: false, reason: '令牌无效或已过期 · HTTP 401 · 请在 CNB 重新生成访问令牌' };
       }
-      return { ok: false, reason: `无法验证令牌：${e?.message || e}` };
+      return { ok: false, reason: `令牌验证失败 · ${e?.message || e}` };
     }
   }
 
@@ -1348,7 +1348,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     const changed = tokenChanged || proxyChanged;
     if (changed) {
       if (tokenChanged) {
-        say('令牌已更新，重新识别工作区');
+        say('令牌已更新 · 重新识别工作区');
       }
       cfg.token = token || cfg.token;
       cfg.proxyKey = proxyKey || cfg.proxyKey;
@@ -1524,16 +1524,16 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return {
       type: 'password',
       key: 'token',
-      message: 'CNB 访问令牌 · 在 CNB 头像 → 访问令牌 里生成，是一串字母数字',
-      placeholder: '不是 sk- 开头',
+      message: 'CNB 访问令牌 · 在 CNB 头像 → 访问令牌 页面生成',
+      placeholder: '粘贴访问令牌',
     };
   }
   if (/^sk-/.test(token)) {
     return {
       type: 'text',
       key: 'token',
-      message: '这是 PROXY_KEY（sk- 开头），不是 CNB 访问令牌 · 请重新输入令牌',
-      placeholder: 'CNB 头像 → 访问令牌',
+      message: '该值以 sk- 开头，是 PROXY_KEY，不是 CNB 访问令牌 · 请重新填写令牌',
+      placeholder: '粘贴访问令牌',
     };
   }
 
@@ -1555,8 +1555,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       return {
         type: 'text',
         key: 'orgs',
-        message: '组织 · 没能自动查到，请手动填写 CNB 组织名',
-        placeholder: '组织名',
+        message: '填写组织 · 未能自动获取组织列表，请手动填写 CNB 组织名',
+        placeholder: '组织名，例如 acme',
       };
     }
     // 只有 1 个组织时不必再问「还要加吗」，答案里直接带上结束标记
@@ -1565,18 +1565,18 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       type: 'select',
       key: 'orgs',
       message: only
-        ? `选择组织 · 这个令牌只属于 ${orgs[0]}`
-        : `选择组织 · 该令牌可访问 ${orgs.length} 个组织，每个组织对应一个独立账号`,
+        ? `选择组织 · 该令牌仅属于 ${orgs[0]}`
+        : `选择组织 · 该令牌可访问 ${orgs.length} 个组织，每个组织对应一个账号`,
       options: orgs.slice(0, 40).map((o) => ({
         label: o,
         value: only ? `${o},${ORGS_DONE}` : o,
         // 连加多个只是为了少贴几次令牌，不是必须。只加这一个、剩下的
         // 以后再登一次照样行（同一份令牌重复贴而已），所以提示写清楚。
         hint: only
-          ? '唯一选项'
+          ? '唯一可选'
           : (seenOrgs.has(o)
-            ? '已加过账号 · 同组织同仓库会覆盖原账号'
-            : '可以继续加其他组织，也可以只加这个'),
+            ? '已有同组织账号 · 同组织同仓库将覆盖原账号'
+            : '可继续添加其他组织，也可仅添加该组织'),
       })),
     };
   }
@@ -1598,7 +1598,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return {
       type: 'text',
       key: `repo@${manualOrg}`,
-      message: `填写仓库名 · ${manualOrg} 下跑着 cnb2api 的那个仓库`,
+      message: `填写仓库 · ${manualOrg} 下运行 cnb2api 的仓库`,
       placeholder: '仓库名，或 组织/仓库',
     };
   }
@@ -1614,7 +1614,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       return {
         type: 'text',
         key: `repo@${needRepo}`,
-        message: `填写仓库名 · ${needRepo} 的仓库列表没能查到`,
+        message: `填写仓库 · 未能获取 ${needRepo} 的仓库列表`,
         placeholder: '组织/仓库',
       };
     }
@@ -1623,16 +1623,16 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       return {
         type: 'text',
         key: `repo@${needRepo}`,
-        message: `填写仓库名 · ${needRepo} 下没找到跑着 cnb2api 的仓库`,
-        placeholder: '只写仓库名即可，组织用上面选的',
+        message: `填写仓库 · ${needRepo} 下未找到运行 cnb2api 的仓库`,
+        placeholder: '只填仓库名，组织取上一步所选',
       };
     }
     return {
       type: 'select',
       key: `repo@${needRepo}`,
       message: found.length === 1
-        ? `确认仓库 · ${needRepo} 下只有 1 个在跑 cnb2api`
-        : `选择仓库 · ${needRepo} 下有 ${found.length} 个在跑 cnb2api`,
+        ? `确认仓库 · ${needRepo} 下仅有 1 个运行 cnb2api 的仓库`
+        : `选择仓库 · ${needRepo} 下有 ${found.length} 个运行 cnb2api 的仓库`,
       options: [
         ...found.map((r) => ({
           label: r.repo,
@@ -1642,7 +1642,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         {
           label: '手动填写仓库名…',
           value: REPO_MANUAL,
-          hint: '要用的仓库不在上面',
+          hint: '目标仓库不在列表中',
         },
       ],
     };
@@ -1676,7 +1676,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           type: 'password',
           key: keyName,
           message: `${targets.length === 1 ? 'PROXY_KEY' : `${pending.repo} 的 PROXY_KEY`}`
-            + ' · 这个仓库 .cnb.yml 里 env 的值',
+            + ' · 取自该仓库 .cnb.yml 的 env',
           placeholder: 'sk-…',
         };
       }
@@ -1684,17 +1684,17 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         return {
           type: 'select',
           key: keyName,
-          message: `${pending.repo} 的 PROXY_KEY · 每个仓库各有一份`,
+          message: `${pending.repo} 的 PROXY_KEY · 每个仓库各配置一份`,
           options: [
             {
-              label: '和上一个仓库相同',
+              label: '与上一个仓库相同',
               value: KEY_SAME,
               hint: `沿用 ${prevRepo} 的值`,
             },
             {
-              label: '填一个不同的',
+              label: '填写其他值',
               value: KEY_OTHER,
-              hint: '这个仓库 .cnb.yml 里是另一个值',
+              hint: '该仓库 .cnb.yml 中是另一个值',
             },
           ],
         };
@@ -1702,7 +1702,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       return {
         type: 'password',
         key: keyName,
-        message: `${pending.repo} 的 PROXY_KEY · 这个仓库 .cnb.yml 里 env 的值`,
+        message: `${pending.repo} 的 PROXY_KEY · 取自该仓库 .cnb.yml 的 env`,
         placeholder: 'sk-…',
       };
     }
@@ -1722,26 +1722,26 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     });
     const options = [{
       label: picked.list.length === 1
-        ? '完成登录 · 只加这 1 个'
+        ? '完成登录 · 仅添加这 1 个'
         : '完成登录',
       value: `${picked.list.join(',')},${ORGS_DONE}`,
       hint: `将添加 ${picked.list.length} 个账号：${full.join('、')}`,
     }];
     for (const o of rest.slice(0, 20)) {
       options.push({
-        label: `再加一个组织：${o}`,
+        label: `添加组织：${o}`,
         value: `${picked.list.join(',')},${o}`,
         hint: seenOrgs.has(o)
-          ? '已加过它的账号 · 这次加的是同组织下另一个仓库'
-          : `接着选 ${o} 下的仓库`,
+          ? '已有该组织的账号 · 本次添加同组织下的另一仓库'
+          : `继续选择 ${o} 下的仓库`,
       });
     }
     return {
       type: 'select',
       key: 'orgs',
       message: rest.length
-        ? '还要添加其他组织吗 · 选「完成登录」即保存，令牌和 PROXY_KEY 不会再问'
-        : '组织都配好了 · 确认完成登录',
+        ? '添加其他组织 · 选择「完成登录」即保存，不再询问令牌与 PROXY_KEY'
+        : '组织配置完成 · 确认以结束登录',
       options,
     };
   }
@@ -1795,10 +1795,10 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           // 顺序和 ask() 一致：令牌 → 组织 → 仓库 → PROXY_KEY。
           // 组织/仓库必须问：额度按组织算、地址按仓库算，缺了就分不开。
           prompts: [
-            { type: 'password', key: 'token', message: 'CNB 访问令牌 · CNB 头像 → 访问令牌' },
+            { type: 'password', key: 'token', message: 'CNB 访问令牌 · 在 CNB 头像 → 访问令牌 页面生成' },
             { type: 'text', key: 'org', message: '组织 · 例如 acme' },
             { type: 'text', key: 'repo', message: '仓库 · 组织/仓库，例如 acme/gateway' },
-            { type: 'password', key: 'proxyKey', message: 'PROXY_KEY · 那个仓库 .cnb.yml 里 env 的值' },
+            { type: 'password', key: 'proxyKey', message: 'PROXY_KEY · 取自该仓库 .cnb.yml 的 env' },
           ],
 
           // ---- 动态提问：一步一步来，每步都拉真实数据做成下拉 ----
@@ -1813,14 +1813,14 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             const targets = targetsOf(inputs);
             // PROXY_KEY 是每个仓库各一份的，按仓库存、按仓库取（见 keyMapOf）
             const keys = keyMapOf(inputs, targets);
-            if (!token) return { type: 'failed', error: '请填写 CNB 访问令牌' };
+            if (!token) return { type: 'failed', error: 'CNB 访问令牌未填写' };
             // 缺 key 的仓库单独点名，别只说一句"请填写 PROXY_KEY"让人猜是哪个
             const keyless = targets.filter((t) => !keys.get(t.repo)).map((t) => t.repo);
             if (keyless.length) {
               return {
                 type: 'failed',
-                error: `还没填这些仓库的 PROXY_KEY · ${keyless.join('、')}。`
-                  + '每个仓库一份，取该仓库 .cnb.yml 里 env 的值。',
+                error: `以下仓库缺少 PROXY_KEY：${keyless.join('、')}`
+                  + ' · PROXY_KEY 按仓库配置，取自该仓库 .cnb.yml 的 env',
               };
             }
 
@@ -1837,7 +1837,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               if (res.status === 401) {
                 return {
                   type: 'failed',
-                  error: 'CNB 访问令牌无效或已过期 · 去 CNB 头像 → 访问令牌 重新生成一个。',
+                  error: 'CNB 访问令牌无效或已过期 · 请在 CNB 头像 → 访问令牌 重新生成',
                 };
               }
               if (res.status === 403) {
@@ -1845,12 +1845,12 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
                 const ex = explainScope(body);
                 return {
                   type: 'failed',
-                  error: `CNB 访问令牌缺少必需权限 · ${(ex?.missing || []).join('、') || 'account-engage:r'}。`
-                    + '在令牌编辑页勾上后重试。',
+                  error: `CNB 访问令牌缺少必需权限：${(ex?.missing || []).join('、') || 'account-engage:r'}`
+                    + ' · 请在令牌编辑页勾选后重试',
                 };
               }
             } catch (e) {
-              return { type: 'failed', error: `没能验证 CNB 访问令牌 · ${e.message}` };
+              return { type: 'failed', error: `CNB 访问令牌验证失败 · ${e.message}` };
             }
 
             // /user 拿不到也不致命，但拿不到就没法保证账号唯一性
@@ -1867,8 +1867,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             if (!uid) {
               return {
                 type: 'failed',
-                error: '没能从令牌读出 CNB 账号信息 · 缺 account-engage:r 权限时会发生，'
-                  + '勾上后重试。',
+                error: '未能从令牌读取账号信息 · 通常是缺少 account-engage:r 权限 · 勾选后重试',
               };
             }
 
@@ -1877,9 +1876,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             if (sameAsToken.length) {
               return {
                 type: 'failed',
-                error: `${sameAsToken.join('、')} 的 PROXY_KEY 和 CNB 访问令牌是同一个值。`
-                  + '这两个不是一回事：令牌在 CNB 头像 → 访问令牌 里生成，'
-                  + 'PROXY_KEY 在那个仓库 .cnb.yml 的 env 里。',
+                error: `${sameAsToken.join('、')} 的 PROXY_KEY 与 CNB 访问令牌相同 · 两者用途不同：`
+                  + 'CNB 访问令牌在 CNB 头像 → 访问令牌 页面生成，PROXY_KEY 位于该仓库 .cnb.yml 的 env',
               };
             }
 
@@ -1891,8 +1889,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             if (!targets.length) {
               return {
                 type: 'failed',
-                error: '没有选择仓库 · 地址和账号都按仓库算，请重新登录，'
-                  + '在「选择仓库」那一步点一个（列表里没有就选「手动填写仓库名…」）。',
+                error: '未选择仓库 · 地址与账号均按仓库确定 · 请重新登录，'
+                  + '在「选择仓库」步骤选择一项；列表中没有目标仓库时选择「手动填写仓库名…」',
               };
             }
 
@@ -1909,7 +1907,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               `新增 ${targets.length} 个账号：${targets.map(displayOf).join('、')}`,
             ];
             if (repos && repos.length) {
-              notes.push(`该用户名下共 ${repos.length} 个仓库${repos.length > 8 ? '（只列前 8 个）' : ''}：`
+              notes.push(`该用户名下共有 ${repos.length} 个仓库${repos.length > 8 ? '（仅列前 8 个）' : ''}：`
                 + repos.slice(0, 8).join('、'));
             }
             say(`登录完成\n  ${notes.join('\n  ')}`);
@@ -1949,10 +1947,10 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             if (all.length > 1) {
               const { unsupported, failed } = await adoptAccounts(all.slice(1));
               if (unsupported) {
-                warn('当前 magpie 版本不支持一次写入多个账号 · 这些需要各登录一次：'
+                warn('当前 magpie 版本不支持一次写入多个账号 · 以下账号需分别登录：'
                   + `${targets.slice(1).map((t) => t.repo).join('、')}`);
               } else if (failed.length) {
-                warn(`这些账号没能写入 · ${failed.join('、')}，需要各登录一次`);
+                warn(`以下账号写入失败 · ${failed.join('、')} · 需分别登录`);
               }
             }
 
@@ -2011,28 +2009,28 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
                 // 额度用尽是"不必拉起"，不是"没起来"，别让人去查工作区
                 if (state.quotaBlocked) {
                   return oaiError(503, state.quotaBlocked.message,
-                    'AI credits 补足后工作区会自动拉起，也可以再调一次 cnb2api_workspace_start');
+                    '额度补足后工作区将自动启动 · 也可再次调用 cnb2api_workspace_start');
                 }
                 // 走到这里说明不是 token/权限问题，而是工作区没起来
                 return oaiError(503,
-                  `cnb2api 地址不可用：${state.lastError || '工作区未就绪'}`,
-                  '检查工作区是否已启动；需要权限 account-engage:r + repo-cnb-trigger:r');
+                  `cnb2api 地址不可用 · ${state.lastError || '工作区未就绪'}`,
+                  '检查工作区是否已启动 · 需要权限 account-engage:r 与 repo-cnb-trigger:r');
               }
               if (!state.uri) {
                 // 三种原因分别给不同指引，别一律让人去改令牌
                 const why = state.lastError || 'cnb2api 不可用';
                 let hint;
                 if (!cfg.token) {
-                  hint = `还没填 token。执行 magpie plugin options ${PLUGIN_ID} `
-                    + '\'{"token":"你的 CNB 访问令牌"}\'，或在 Plugins → CNB2API → Options 里填';
+                  hint = `CNB 访问令牌未填写 · 执行 magpie plugin options ${PLUGIN_ID} `
+                    + '\'{"token":"你的 CNB 访问令牌"}\'，或在 magpie 界面 → Plugins → CNB2API → Options 中填写';
                 } else if (/仓库 .* 不存在/.test(why)) {
-                  hint = '检查插件选项里的 repo，可填 org/repo、仓库名、或仓库页面地址';
+                  hint = '检查插件选项中的 repo · 可填写 org/repo、仓库名或仓库页面地址';
                 } else if (/令牌无效|401/.test(why)) {
-                  hint = 'CNB → 头像 → 访问令牌，重新生成一个（勾上必需权限）后填回插件选项';
+                  hint = '在 CNB 头像 → 访问令牌 中重新生成并勾选必需权限，然后填写回插件选项';
                 } else if (state.quotaBlocked) {
-                  hint = 'AI credits 补足后工作区会自动拉起，也可以再调一次 cnb2api_workspace_start';
+                  hint = '额度补足后工作区将自动启动 · 也可再次调用 cnb2api_workspace_start';
                 } else {
-                  hint = `检查必需权限 ${PERMISSIONS.filter((p) => p.need === 'required').map((p) => p.scope).join(' + ')}`;
+                  hint = `请检查必需权限 ${PERMISSIONS.filter((p) => p.need === 'required').map((p) => p.scope).join(' + ')}`;
                 }
                 return oaiError(503, why, hint);
               }
@@ -2054,7 +2052,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               const res = await send(first);
               // 401 说明 proxyKey 不对：补一句人话，并保留 401 让 magpie 标记账号
               if (res.status === 401) {
-                return annotate(res, `cnb2api 拒绝了密钥 · 检查 ${cfg.repo || '这个仓库'} 的 PROXY_KEY 是否和它 .cnb.yml 里 env 的值一致`);
+                return annotate(res, `cnb2api 拒绝该密钥 · 请检查 ${cfg.repo || '该仓库'} 的 PROXY_KEY 是否与 .cnb.yml 的 env 一致`);
               }
               // 402 EXCEEDING_LIMIT：组织的 AI credits 用尽。原文是一段
               // 夹着 request id 的长句，翻成"该找谁、要不要重试"更有用。
@@ -2062,12 +2060,12 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
                 const body = await res.clone().text().catch(() => '');
                 if (/EXCEEDING_LIMIT|积分已用尽|credits are exhausted/i.test(body)) {
                   return annotate(res,
-                    '额度用尽期间插件不会自动拉起工作区 · 补足后会自动再试');
+                    '额度用尽期间插件不会自动启动工作区 · 额度补足后将自动重试');
                 }
               }
               return res;
             } catch (e) {
-              warn(`请求失败，先刷新地址 · ${e.message}`);
+              warn(`请求失败 · 先刷新地址 · ${e.message}`);
               // 并发请求共用一次恢复动作：否则 5 个请求会各自 refresh
               // 并各自等 120 秒，把 CNB 接口打成筛子。
               if (!state.recoveringPromise) {
@@ -2079,7 +2077,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               }
               await state.recoveringPromise;
               const again = target();
-              if (!again) return oaiError(503, `cnb2api 请求失败：${e.message}`, state.lastError || '');
+              if (!again) return oaiError(503, `cnb2api 请求失败 · ${e.message}`, state.lastError || '');
               if (again !== first) say(`改用新地址重试 · ${maskHost(hostOf(state.uri))}`);
               return await send(again);
             }
@@ -2118,6 +2116,11 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
         // 账号在界面上的名字。格式 "用户 | 组织/仓库"：粒度到仓库，
         // 同组织下两个仓库是两个账号，只写用户名或只写组织都分不开。
         // 不返回 user 的话宿主要拿 key 尾缀当名字（"API key …-key"）。
+        //
+        // ⚠️ 这个字符串不只是显示名：magpie 拿它当持久化键，写进
+        // quotas.json / quota-history.json / providers.json 的 accountNames。
+        // 所以格式一旦定下就不要再改 —— 改了等于多出一个"新账号"，
+        // 旧键会永远留在宿主的缓存里（tools/magpie-prune.mjs 可清）。
         const userName = String(auth?.metadata?.username || '').trim();
         const authRepo = String(auth?.metadata?.repo || '').trim();
         // email 已经是 "用户 | 组织/仓库"（去掉 @cnb.cool），没有 username
@@ -2164,7 +2167,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             ? `ok · ${maskHost(host)}`
             : `不可用 · ${!state.uri
               ? (state.lastError
-                || (state.status === 'none' ? '这个仓库还没有工作区' : '正在识别工作区'))
+                || (state.status === 'none' ? '该仓库尚无工作区' : '正在识别工作区'))
               : (running ? (state.lastError || '地址未响应') : '工作区已停止')}`,
         }];
 
@@ -2178,7 +2181,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           out.windows.push({
             name: 'auto-restart',
             aside: true,
-            display: '已关闭 · 缺 repo-cnb-trigger:rw',
+            display: '已关闭 · 缺少 repo-cnb-trigger:rw',
           });
         }
 
@@ -2192,7 +2195,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           out.windows.push({ name: 'AI credits', aside: true, text: true, display: why });
         };
         if (!org || !cfg.token) {
-          quotaUnavailable(!cfg.token ? '查不到 · 还没读到 CNB 访问令牌' : '查不到 · 仓库未确定');
+          quotaUnavailable(!cfg.token ? '查不到 · 尚未读取到 CNB 访问令牌' : '查不到 · 仓库未确定');
         } else {
           try {
             // 界面钩子等不起：4 秒拿不到就照实报"超时"，不拖住整个面板
@@ -2223,11 +2226,11 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
                 name: 'AI credits',
                 aside: true,
                 text: true,
-                display: `可用 ${num1(c.remain)} / ${num1(c.total)} cr · 已用量没取到`
+                display: `可用 ${num1(c.remain)} / ${num1(c.total)} cr · 已用量未取到`
                   + (q.errors?.length ? `（${q.errors[0]}）` : ''),
               });
             } else {
-              quotaUnavailable(`查不到 · ${q?.errors?.[0] || '令牌可能缺 group-resource:r'}`);
+              quotaUnavailable(`查不到 · ${q?.errors?.[0] || '令牌可能缺少 group-resource:r'}`);
             }
             if (q?.devHours && q.devHours.used != null) {
               const d = q.devHours;
@@ -2260,7 +2263,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     // 宿主的 runTool 不注入账号作用域，所以要自己遍历 ctxs 跑每个账号。
     tool: {
       cnb2api_workspace_status: {
-        description: '查看 CNB2API 工作区状态：是否运行、所属仓库、当前地址、工作区编号。',
+        description: '查看工作区状态：运行状态、所属仓库、当前地址、工作区编号。',
         args: {},
         async execute() {
           return forEachAccount(async (ctx) => {
@@ -2279,7 +2282,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
 
       cnb2api_workspace_start: {
         description:
-          '拉起 CNB2API 的工作区。工作区停止后调用；从提交到代理可用约 30–90 秒。',
+          '启动工作区 · 适用于工作区已停止时 · 从提交到网关可用约 30–90 秒。',
         args: {},
         async execute() {
           return forEachAccount(async () => {
@@ -2292,24 +2295,24 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
               // 拦下来的原因（额度用尽 / 缺权限 / 接口报错）已经写在 lastError 里
               return [state.quotaBlocked
                 ? state.quotaBlocked.message
-                : `没能拉起 · ${state.lastError || '原因未知'}`];
+                : `启动失败 · ${state.lastError || '原因未知'}`];
             }
             const ok = await waitForReady(90_000).catch(() => false);
             return [ok
-              ? `已拉起，可以用了 · ${maskHost(hostOf(state.uri))}`
-              : `已提交拉起，但还没就绪 · ${state.lastError || '等待中'}，稍后再查或直接发请求`];
+              ? `已启动 · 地址可用 · ${maskHost(hostOf(state.uri))}`
+              : `启动已提交 · 尚未就绪 · ${state.lastError || '等待中'} · 请稍后查询或直接发起请求`];
           });
         },
       },
 
       cnb2api_quota: {
         description:
-          '查这个账号所属组织的核时与 AI Credits 余量。',
+          '查询该账号所属组织的核时与 AI credits 余量。',
         args: {},
         async execute() {
           return forEachAccount(async () => {
             const org = (cfg.repo || '').split('/')[0];
-            if (!org || !cfg.token) return ['还没配好令牌或仓库，查不了额度'];
+            if (!org || !cfg.token) return ['令牌或仓库尚未配置 · 无法查询额度'];
             const q = await charge(org, 8000).catch((e) => ({ errors: [e.message] }));
             const lines = [];
             if (q?.devHours) {
@@ -2319,11 +2322,11 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             }
             if (q?.credit) {
               const c = q.credit;
-              lines.push(`AI Credits 已用 ${num1(c.used)} / ${num1(c.total)} cr`
+              lines.push(`AI credits 已用 ${num1(c.used)} / ${num1(c.total)} cr`
                 + ` · 剩余 ${num1(c.remain)} cr`);
             }
             if (!lines.length) {
-              lines.push(`没拿到额度数据 · ${q?.errors?.[0] || '多半是令牌缺 group-resource:r 权限'}`);
+              lines.push(`未获取到额度数据 · ${q?.errors?.[0] || '通常为令牌缺少 group-resource:r 权限'}`);
             }
             return lines;
           });

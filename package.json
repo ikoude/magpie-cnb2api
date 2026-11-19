@@ -1,13 +1,22 @@
 {
   "name": "magpie-cnb2api",
   "version": "0.1.0",
-  "description": "Serve the cnb2api running in your own CNB workspace as a magpie provider: keeps up with the drifting *.cnb.run address, restarts the workspace when it stops, shows the workspace's real AI credits and core-hours, and keeps one account per user + org/repo.",
+  "description": "A magpie provider for the cnb2api gateway in your own CNB workspace: follows the workspace address as it changes, restarts the workspace when it stops, and reports its AI credits and core-hours.",
   "type": "module",
   "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "bin": {
+    "magpie-cnb2api-prune": "./tools/magpie-prune.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "files": [
     "index.mjs",
     "README.md",
-    "icon.svg"
+    "icon.svg",
+    "LICENSE",
+    "tools/"
   ],
   "keywords": [
     "magpie",
@@ -21,8 +30,8 @@
     "name": "CNB2API",
     "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCIgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0Ij4KICA8cmVjdCB3aWR0aD0iNjQiIGhlaWdodD0iNjQiIHJ4PSIxNCIgZmlsbD0iIzE4NUZBNSIvPgogIDxwYXRoIGQ9Ik0xNCA0MCBMMzIgMjIgTDUwIDQwIiBmaWxsPSJub25lIiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iNSIKICAgICAgICBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz4KICA8Y2lyY2xlIGN4PSIzMiIgY3k9IjQ2IiByPSI0LjUiIGZpbGw9IiNmZmYiLz4KPC9zdmc+Cg==",
     "summary": {
-      "en": "Turns the cnb2api in your own CNB workspace into a magpie provider. The workspace address changes on every restart and the workspace gets stopped by the platform — this follows the address and starts it again. It also shows the workspace's real AI credits and core-hours, and keeps one account per user and org/repo.",
-      "zh": "把你自己的 CNB 工作区里的 cnb2api 接成 magpie 供应商。工作区每次重启地址都会变、停了就完全没响应——插件负责跟住地址、并在停了之后把工作区拉起来；顺带把工作区的真实 AI credits 和核时显示到用量面板，多账号按「用户 + 组织/仓库」各算一个。"
+      "en": "Serves the cnb2api gateway in your own CNB workspace as a magpie provider: follows the address that changes on every restart, restarts a workspace the platform has stopped, and reports its AI credits and core-hours.",
+      "zh": "把 CNB 工作区里的 cnb2api 接成 magpie 供应商。工作区地址每次重启都会变，被平台停止后不再响应；插件跟随地址变化，在停止后重新启动，并显示该工作区的 AI credits 与核时。"
     },
     "options": {
       "repo": "",
