@@ -786,17 +786,21 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return '识别中';
   }
 
-  // 徽标（账号名后那枚小字，magpie 的 plan 字段）：回答"现在能不能用"。
-  // 在跑不等于能用 —— 额度归零、地址不通时机器在转，请求却全被拒（402 / 连不上），
-  // 所以结论按可用性排，而不是按"在不在跑"排：
-  //   可用（在跑、地址通、额度够） · 无额（在跑，但 AI credits 归零）
-  //   掉线（在跑，但地址不通）     · 停止 / 未建 / 启动 / 异常 / 未知
+  // 徽标（账号名后那枚小字，magpie 的 plan 字段）：回答"现在卡在哪一环"。
+  // 它不是工作区状态的同义词，也不是一句笼统的"能不能用"——单个词只能答一件事，
+  // 所以取**最卡住你的那一环**，按下面的优先顺序（前一条压住后一条）：
+  //   异常（令牌/仓库硬失败） < 无额（AI credits 归零，启动与请求都过不去）
+  //   < 掉线（在跑但地址不通）/ 停止（有实例，没在跑）/ 未建（从未建过）
+  //   < 启动（过渡态）/ 可用（哪一环都不卡）
+  // 无额压过"停止"：停机时额度也归零，那更该说的是没额度——机器都没跑起来，
+  // 光写"停止"会让人以为补上实例就能用。停机但额度还在才是"停止"。
   // 一律两字：字数一样、中文字宽一致，加上 .acc-line > .plan 的 min-width: 3em，
   // 不同账号的徽标宽度才一致，不会随组织名长短漂移。
   // 宿主不认中文，所以不会把它当订阅计划做首字母大写之类的改写。
   function badgeWord(alive, creditDead) {
-    if (alive) return creditDead ? '无额' : '可用';
     if (state.fatal) return '异常';
+    if (creditDead) return '无额';
+    if (alive) return '可用';
     const st = state.status;
     if (st === 'running') return '掉线';
     if (st === 'closed') return '停止';
@@ -2355,14 +2359,23 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           // 3) 工作区行放到最后拼：它要带上"额度有没有归零"这个结论，
           //    而额度是上面才查到的。一处拼装，就不必再回头改写字符串。
           wsRow.display = workspaceLine(alive, creditDead);
-          // 徽标同样要等额度结论：它在账号名后，是"能不能用"的第一眼答案
-          out.plan = badgeWord(alive, creditDead);          // aside 的语义是"用掉它不影响账号可用"。额度归零时这句话不成立，
+          // 徽标同样要等额度结论：它在账号名后，答"现在卡在哪一环"
+          out.plan = badgeWord(alive, creditDead);
+          // aside 的语义是"用掉它不影响账号可用"。额度归零时这句话不成立，
           // 它恰恰决定这个账号能不能用。
           wsRow.aside = !creditDead;
 
           // 想看完整地址时设这个环境变量（分享截图前记得关掉）
           if (process.env.CNB2API_SHOW_FULL_HOST === '1' && alive && host) {
             wsRow.display = wsRow.display.replace(maskHost(host), host);
+          }
+          // 版面：面板把两个窗口排进一行 flex，放得下就并排。没有地址的状态行很
+          // 短（"已停止"），credits 于是又被拽回同一行——四个账号一会儿一行、
+          // 一会儿两行。窗口里塞不进换行符，只能用全角空格把首行撑到放不下，
+          // 让 credits 稳定落到第二行；有地址时本来就超宽，不必撑。
+          // 门槛压在 12 字以内：更长的文案（"不可用 · 具体原因"）自己就够宽。
+          if (!(alive && host) && [...wsRow.display].length <= 12) {
+            wsRow.display += '\u3000'.repeat(24);
           }
           // 版面收尾：workspace → AI credits → 补充说明 → dev core-hours → 明细。
           // 前两位是面板那两行（工作区状态、credits），核时与明细不进可视区，

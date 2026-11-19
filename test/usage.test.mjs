@@ -2,6 +2,10 @@
 import { Cn2ApiPlugin } from '../index.mjs';
 import { ok, json, pathOf, sleep, summary } from './_harness.mjs';
 
+// workspace 行末尾可能带全角空格：面板只认宽度、不给换行，插件靠它把
+// credits 顶到第二行（见 index.mjs 的版面注释）。断言前先剥掉。
+const plain = (s) => String(s ?? '').replace(/\u3000+$/, '');
+
 const world = {
   status: 'closed',
   startDelayMs: 7000,
@@ -85,7 +89,7 @@ console.log('\n[1] 工作区已停止 + start 很慢：usage 不能等它');
   ok(!!credit, '额度卡片有 AI credits 行');
   ok(credit && credit.used != null, `额度带读数 used=${credit?.used}`);
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
-  ok(ws?.display === '已停止', `workspace 行只说状态，实际 ${ws?.display}`);
+  ok(plain(ws?.display) === '已停止', `workspace 行只说状态，实际 ${ws?.display}`);
   // 账号名后的徽标（plan）一律两字中文：字数一样宽度才一样，
   // 四个账号的徽标才会落在同一列上。
   ok(out.plan === '停止', `徽标是两字中文，实际 ${out.plan}`);
@@ -117,7 +121,7 @@ console.log('\n[3] 额度正常时仍然照常显示');
   ok(det?.display === '已用 300 / 1166 cr', `明细写明已用/总额，实际 ${det?.display}`);
   ok(!/已用 300/.test(credit?.display || ''), '进度行不再重复数字');
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
-  ok(/^就绪 · /.test(ws?.display || ''), `可用时写就绪，实际 ${ws?.display}`);
+  ok(/^就绪 · /.test(plain(ws?.display)), `可用时写就绪，实际 ${ws?.display}`);
   // 版面：账号卡的额度行只排前两个窗口，workspace 若排第一就会把额度挤到
   // 同一行右侧。两个额度必须占据前两位，workspace 落在后面（悬停提示里）。
   const names = (out.windows || []).map((w) => w.name);
@@ -159,8 +163,8 @@ console.log('\n[6] 额度打满但工作区在跑：不能显示 ok');
   const { plugin, auth } = await boot();
   const out = await plugin.auth.usage(async () => auth);
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
-  ok(/^运行中 · /.test(ws?.display || ''), `状态词降级为运行中，实际 ${ws?.display}`);
-  ok(!/credits|额度/.test(ws?.display || ''), 'workspace 行不再夹带额度话术');
+  ok(/^运行中 · /.test(plain(ws?.display)), `状态词降级为运行中，实际 ${ws?.display}`);
+  ok(!/credits|额度/.test(plain(ws?.display)), 'workspace 行不再夹带额度话术');
   ok(ws?.aside === false, 'aside 置 false：它确实影响可用性');
   ok(out.plan === '无额', `在跑但额度归零 → 徽标"无额"，实际 ${out.plan}`);
   const credit = (out.windows || []).find((w) => w.name === 'AI credits');
@@ -173,7 +177,7 @@ console.log('\n[7] 额度打满且工作区已停：说明不会自动启动');
   const { plugin, auth } = await boot();
   const out = await plugin.auth.usage(async () => auth);
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
-  ok(ws?.display === '已停止', `只给状态词，实际 ${ws?.display}`);
+  ok(plain(ws?.display) === '已停止', `只给状态词，实际 ${ws?.display}`);
   const credit2 = (out.windows || []).find((w) => w.name === 'AI credits');
   ok(/^已用尽 · /.test(credit2?.display || ''), `额度行点明已用尽，实际 ${credit2?.display}`);
   const det2 = (out.windows || []).find((w) => w.name === 'AI credits 明细');
@@ -189,9 +193,11 @@ console.log('\n[8] 首屏还没识别完：过渡态不要套额度结论');
   const { plugin, auth } = await boot();
   const out = await plugin.auth.usage(async () => auth);
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
-  ok(ws?.display === '识别中', `过渡态只有一个词，实际 ${ws?.display}`);
-  ok(!/已用尽/.test(ws?.display || ''), '过渡态不追加额度结论');
-  ok(out.plan === '未知', `还没查到状态时徽标是"未知"，实际 ${out.plan}`);
+  ok(plain(ws?.display) === '识别中', `过渡态只有一个词，实际 ${ws?.display}`);
+  ok(!/已用尽/.test(plain(ws?.display)), '过渡态不追加额度结论');
+  // 状态还没识别出来，但额度已经查到了：额度归零是确定的结论，
+  // 不该被"未知"盖住——徽标答的是"卡在哪一环"
+  ok(out.plan === '无额', `额度已知时照实说无额，实际 ${out.plan}`);
   world.empty = false; world.usedMilli = 300000; world.listDelayMs = 0;
 }
 
@@ -202,7 +208,7 @@ console.log('\n[9] 仓库里没有工作区：徽标"未建"，不是英文 none
   const out = await plugin.auth.usage(async () => auth);
   ok(out.plan === '未建', `徽标是"未建"，实际 ${out.plan}`);
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
-  ok(ws?.display === '无工作区', `workspace 行同样说无工作区，实际 ${ws?.display}`);
+  ok(plain(ws?.display) === '无工作区', `workspace 行同样说无工作区，实际 ${ws?.display}`);
   world.empty = false;
 }
 
@@ -215,8 +221,43 @@ console.log('\n[10] 列表不带 slug：服务端的 slug 过滤会漏掉已停�
   const out = await plugin.auth.usage(async () => auth);
   ok(!/[?&]slug=/.test(world.listQuery), `列表不带 slug，实际 ${world.listQuery}`);
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
-  ok(ws?.display === '已停止', `别的仓库的 running 不冒充本仓库，实际 ${ws?.display}`);
+  ok(plain(ws?.display) === '已停止', `别的仓库的 running 不冒充本仓库，实际 ${ws?.display}`);
   ok(out.plan === '停止', `徽标跟着本仓库走，实际 ${out.plan}`);
+}
+
+console.log('\n[11] 停机且额度归零：徽标说"无额"，不能被"停止"盖住');
+{
+  // 停机时额度也归零，更该说的是没额度——机器都没跑起来，只写"停止"
+  // 会让人以为补上实例就能用。徽标答的是"卡在哪一环"，不是工作区状态。
+  world.status = 'closed'; world.empty = false; world.chargeStatus = 200;
+  world.usedMilli = 1166000;   // 已用 = 总额：可用 0
+  const { plugin, auth } = await boot();
+  const out = await plugin.auth.usage(async () => auth);
+  ok(out.plan === '无额', `额度耗尽压过停机，实际 ${out.plan}`);
+  const ws = (out.windows || []).find((w) => w.name === 'workspace');
+  ok(plain(ws?.display) === '已停止', `工作区状态照实写，实际 ${ws?.display}`);
+  const credit = (out.windows || []).find((w) => w.name === 'AI credits');
+  ok(/^已用尽/.test(credit?.display || ''), `额度行写明已用尽，实际 ${credit?.display}`);
+  world.usedMilli = 300000;
+}
+
+console.log('\n[12] 版面：没地址的状态行要撑够宽，credits 才落到第二行');
+{
+  // 面板把两个窗口排进一行 flex，放得下就并排。"已停止"太短，
+  // credits 会被拽回同一行，四个账号一会儿一行一会儿两行。
+  world.status = 'closed'; world.chargeStatus = 200; world.usedMilli = 300000; world.alive = true;
+  const { plugin, auth } = await boot();
+  const out = await plugin.auth.usage(async () => auth);
+  const ws = (out.windows || []).find((w) => w.name === 'workspace');
+  ok(/\u3000{20,}$/.test(ws?.display || ''), `短行末尾补全角空格，实际 ${JSON.stringify(ws?.display)}`);
+
+  // 有地址时本来就超宽，不该再补——补了会溢出卡片
+  world.status = 'running'; world.alive = true;
+  const { plugin: p2, auth: a2 } = await boot();
+  const out2 = await p2.auth.usage(async () => a2);
+  const ws2 = (out2.windows || []).find((w) => w.name === 'workspace');
+  ok(/^就绪 · /.test(ws2?.display || ''), `有地址时不补空格，实际 ${JSON.stringify(ws2?.display)}`);
+  ok(!/\u3000/.test(ws2?.display || ''), '有地址的行不留全角空格');
 }
 
 summary();
