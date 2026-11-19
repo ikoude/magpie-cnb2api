@@ -2184,7 +2184,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           const running = state.status === 'running';
           const alive = state.uri && running ? await health(state.uri, 1500) : false;
           const host = state.uri ? hostOf(state.uri) : '';
-          out.windows = [{
+          const wsRow = {
             name: 'workspace',
             // aside：用掉它不影响账号本身可用（文档语义）
             aside: true,
@@ -2194,7 +2194,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
                 ? (state.lastError
                   || (state.status === 'none' ? '该仓库尚无工作区' : '正在识别工作区'))
                 : (running ? (state.lastError || '地址未响应') : '工作区已停止')}`,
-          }];
+          };
+          out.windows = [wsRow];
 
           // 想看完整地址时设这个环境变量（分享截图前记得关掉）
           if (process.env.CNB2API_SHOW_FULL_HOST === '1' && alive) {
@@ -2216,6 +2217,7 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           // "没有额度"却不知道是缺权限、超时，还是组织不对。额度窗口用
           // text:true（纯文本，不画进度条），aside:true（查不到不代表账号不可用）。
           const org = String(cfg.repo || '').split('/')[0];
+          let creditDead = false;   // 组织 AI credits 余额为 0（用于回头修正 workspace 那行）
           const quotaUnavailable = (why) => {
             out.windows.push({ name: 'AI credits', aside: true, text: true, display: why });
           };
@@ -2242,6 +2244,10 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             try {
               // 界面钩子等不起：4 秒拿不到就照实报"超时"，不拖住整个面板
               const q = await chargeForUsage(org);
+              // 额度归零只拦"启动"和"请求"，不会停掉已经在跑的工作区。
+              // 于是会出现最误导的一种组合：面板写 ok，实际请求一打就 402。
+              // 这里先记下结论，等窗口都拼好了再回来改写那一行。
+              creditDead = q?.credit?.remain != null && q.credit.remain <= 0;
               if (q?.credit && q.credit.used != null) {
                 out.windows.push(progressWindow('AI credits', 'cr', q.credit));
               } else if (q?.credit) {
@@ -2263,6 +2269,24 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
             } catch (e) {
               out.error = `额度查询失败 · ${e.message}`;
               quotaUnavailable(`查不到 · ${e.message}`);
+            }
+          }
+
+          // 3) 把"额度已归零"回填到工作区那一行
+          //    在跑：地址通不代表能用，请求会被上游以 402 拒绝，改为 aside:false
+          //    （它确实影响可用性），文案直接说清楚，不要让人看到 ok 就以为能用。
+          //    已停：补一句"不会自动启动"，否则用户以为插件把重启忘了。
+          if (creditDead) {
+            if (alive) {
+              wsRow.aside = false;
+              wsRow.display = `不可用 · 工作区在跑但额度已用尽 · 请求会被拒绝 · ${maskHost(host)}`;
+            } else if (/工作区已停止|尚无工作区|从未启动过工作区/.test(wsRow.display)
+              && !/额度|credits/i.test(wsRow.display)) {
+              // lastError 已经是额度闸门那句话时就别重复了；
+              // "正在识别工作区"这种 1 秒内的过渡态也不套结论，免得看着自相矛盾
+              wsRow.display += /尚无工作区|从未启动过工作区/.test(wsRow.display)
+                ? ' · 额度已用尽，暂时无法创建'
+                : ' · 额度已用尽，不会自动启动';
             }
           }
           return out;

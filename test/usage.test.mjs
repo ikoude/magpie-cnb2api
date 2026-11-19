@@ -8,6 +8,12 @@ const world = {
   chargeStatus: 200,
   starts: 0,
   alive: true,
+  // volume.credit_in_milli：已用量。等于总额就是额度打满、可用 0
+  usedMilli: 300000,
+  // 列表返回空 = 该仓库从未有过工作区（status 走 none 分支）
+  empty: false,
+  // 首屏识别慢于 usage 的 1200ms 预算：此时面板只能给出默认文案
+  listDelayMs: 0,
 };
 
 globalThis.fetch = async (u0, init = {}) => {
@@ -25,6 +31,8 @@ globalThis.fetch = async (u0, init = {}) => {
   }
   if (p.startsWith('/user')) return json({ username: 'alice' });
   if (p.startsWith('/workspace/list')) {
+    if (world.listDelayMs) await sleep(world.listDelayMs);
+    if (world.empty) return json({ list: [] });
     return json({ list: [{ slug: 'acme/gateway', sn: 'sn-1', status: world.status, create_time: '2026-11-18T10:00:00Z' }] });
   }
   if (m === 'POST' && p.includes('/-/workspace/start')) {
@@ -36,7 +44,7 @@ globalThis.fetch = async (u0, init = {}) => {
   if (p.includes('/-/charge/')) {
     if (world.chargeStatus !== 200) return new Response('{"message":"no scope"}', { status: world.chargeStatus });
     if (p.includes('quota')) return json({ credit_in_milli: { total: 1166000 }, dev_in_sec: { total: 5760000 } });
-    if (p.includes('volume')) return json({ credit_in_milli: 300000, dev_in_sec: 100 });
+    if (p.includes('volume')) return json({ credit_in_milli: world.usedMilli, dev_in_sec: 100 });
     return json({});
   }
   if (p.includes('/build/runner/download/log/')) return new Response('PROXY_URI=https://ab12-{{port}}.cnb.run');
@@ -114,6 +122,47 @@ console.log('\n[5] 仓库未确定：说清楚，不是静默');
   const out = await plugin.auth.usage(async () => auth);
   const credit = (out.windows || []).find((w) => w.name === 'AI credits');
   ok(/查不到/.test(credit?.display || ''), `说明查不到，实际 ${credit?.display}`);
+}
+
+console.log('\n[6] 额度打满但工作区在跑：不能显示 ok');
+{
+  world.status = 'running'; world.alive = true; world.chargeStatus = 200;
+  world.usedMilli = 1166000;          // 已用 = 总额，可用 0
+  const { plugin, auth } = await boot();
+  const out = await plugin.auth.usage(async () => auth);
+  const ws = (out.windows || []).find((w) => w.name === 'workspace');
+  ok(/额度已用尽/.test(ws?.display || ''), `点明额度用尽，实际 ${ws?.display}`);
+  ok(!/^ok/.test(ws?.display || ''), '不再以 ok 开头（地址通 ≠ 能用）');
+  ok(ws?.aside === false, 'aside 置 false：它确实影响可用性');
+  const credit = (out.windows || []).find((w) => w.name === 'AI credits');
+  ok(credit?.used === 100, `进度条 100%，实际 ${credit?.used}`);
+}
+
+console.log('\n[7] 额度打满且工作区已停：说明不会自动启动');
+{
+  world.status = 'closed'; world.usedMilli = 1166000;
+  const { plugin, auth } = await boot();
+  const out = await plugin.auth.usage(async () => auth);
+  const ws = (out.windows || []).find((w) => w.name === 'workspace');
+  ok(/工作区已停止/.test(ws?.display || '') || /已用尽/.test(ws?.display || ''),
+    `说明停着且与额度有关，实际 ${ws?.display}`);
+  ok(/未启动工作区|不会自动启动/.test(ws?.display || ''),
+    `说明不会自动启动，实际 ${ws?.display}`);
+  world.usedMilli = 300000;           // 复原，避免影响后续
+}
+
+console.log('\n[8] 首屏还没识别完：过渡态不要套额度结论');
+{
+  // 识别慢于 1.2s 预算 —— 面板只能显示"正在识别工作区"，
+  // 这时补一句"额度已用尽"会读着自相矛盾
+  world.status = 'closed'; world.usedMilli = 1166000; world.empty = true; world.listDelayMs = 2500;
+  const { plugin, auth } = await boot();
+  const out = await plugin.auth.usage(async () => auth);
+  const ws = (out.windows || []).find((w) => w.name === 'workspace');
+  ok(/正在识别工作区/.test(ws?.display || ''), `过渡态照旧，实际 ${ws?.display}`);
+  ok(!/额度已用尽/.test(ws?.display || ''), '过渡态不追加额度结论');
+  ok(ws?.aside === true, '过渡态仍属 aside');
+  world.empty = false; world.usedMilli = 300000; world.listDelayMs = 0;
 }
 
 summary();
