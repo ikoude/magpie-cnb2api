@@ -35,3 +35,8 @@
 - 需要 magpie 与本机 Node ≥ 20，无第三方依赖。
 - 已实测：macOS（Apple Silicon），magpie 1.x 插件协议；CNB OpenAPI `/workspace/list`、
   `/workspace/*/usage` 等接口。
+
+**文档**
+
+- README 覆盖安装、概念、权限、面板结构、排障与卸载，并列出仓库每个文件的去向与 npm 发布步骤。
+- `SECURITY.md` 说明令牌存在哪、需要哪些权限、报告问题的私密渠道。

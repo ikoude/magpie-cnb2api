@@ -5,13 +5,20 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        node: ['20', '22']
+        node: ['20', '22', '24']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -19,3 +26,5 @@ jobs:
           node-version: ${{ matrix.node }}
       # 无运行时依赖，不需要 npm install；测试也全部用假 fetch，不访问网络
       - run: npm test
+      # 确认打包结果只含 index.mjs、清单、文档与 tools/，测试没被带进包
+      - run: npm pack --dry-run

@@ -298,6 +298,12 @@ PROXY_KEY 的粒度是**仓库**，不是账号，也不是网关：
 
 权限不足时插件不会静默失败：日志与 `magpie quota` 会说明缺少哪一项、影响范围与补救方式。
 
+### 5.4 凭据的存放与上报
+
+令牌与 `PROXY_KEY` 存在 magpie 的数据目录里，由 magpie 以本机用户权限读写；插件不建立
+其他外部连接，不含遥测。工作区地址在日志与面板中默认打码。发现安全问题请走
+[SECURITY.md](SECURITY.md) 里的私密报告渠道，不要开公开 issue。
+
 ---
 
 ## 6. 用量与额度
@@ -663,7 +669,7 @@ npm test     # 9 个测试文件，各自独立进程
 | `test/manifest.test.mjs` | 清单自检：入口与 `magpie` 字段、图标两处一致、`files` 范围、`bin` 可执行、发布目标 |
 
 测试以假的 `fetch` 替代网络，不访问 CNB，也不读写 `~/.config/magpie`。
-CI 在 Node 20 与 22 上各跑一遍（`.github/workflows/test.yml`）。
+CI 在 Node 20、22、24 上各跑一遍，并核对一次 `npm pack` 的内容（`.github/workflows/test.yml`）。
 
 仓库里每个文件的去向：
 
@@ -671,7 +677,7 @@ CI 在 Node 20 与 22 上各跑一遍（`.github/workflows/test.yml`）。
 |---|---|---|
 | `index.mjs` | 插件本体，magpie 只加载它 | 是 |
 | `package.json` | 清单与 `magpie` 字段（名称、图标、选项默认值） | 是 |
-| `README.md` / `CHANGELOG.md` / `LICENSE` | 文档与许可 | 是 |
+| `README.md` / `CHANGELOG.md` / `SECURITY.md` / `LICENSE` | 文档、变更记录、安全说明与许可 | 是 |
 | `icon.svg` | `magpie.icon` 的源文件——包里那个值是它的 base64 | 是 |
 | `tools/magpie-prune.mjs` | 清理脚本，经 `bin` 暴露为 `magpie-cnb2api-prune` | 是 |
 | `test/` | 只给本地与 CI 用，`files` 字段已排除 | 否 |

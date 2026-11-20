@@ -22,10 +22,12 @@
     "index.mjs",
     "README.md",
     "CHANGELOG.md",
+    "SECURITY.md",
     "icon.svg",
     "LICENSE",
     "tools/"
   ],
+  "author": "ikoude",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ikoude/magpie-cnb2api.git"
