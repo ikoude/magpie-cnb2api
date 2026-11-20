@@ -323,6 +323,11 @@ alice | beta/gateway      可用  ⟳                       设为首选
    AI credits   ▬        800 / 1200 cr · 已用 67%
 ```
 
+面板里的实际样子。四个账号分别演示 `可用` / `无额` / `停止` / `未建` 四种徽标，每个账号两行：
+`workspace` 说工作区在不在，`AI credits` 说还剩多少（示例数据）：
+
+![CNB2API 的账号卡：每个账号两行，徽标答「卡在哪一环」](docs/panel-accounts.png)
+
 | 顺序 | 窗口 | 回答的问题 |
 |---|---|---|
 | 1 | `workspace` | 工作区在不在、地址通不通 |
@@ -680,6 +685,7 @@ CI 在 Node 20、22、24 上各跑一遍，并核对一次 `npm pack` 的内容�
 | `README.md` / `CHANGELOG.md` / `SECURITY.md` / `LICENSE` | 文档、变更记录、安全说明与许可 | 是 |
 | `icon.svg` | `magpie.icon` 的源文件——包里那个值是它的 base64 | 是 |
 | `tools/magpie-prune.mjs` | 清理脚本，经 `bin` 暴露为 `magpie-cnb2api-prune` | 是 |
+| `docs/panel-accounts.png` | README 里的面板截图，全部为示例数据 | 是 |
 | `test/` | 只给本地与 CI 用，`files` 字段已排除 | 否 |
 | `.github/` / `.gitignore` | CI 与忽略规则 | 否 |
 

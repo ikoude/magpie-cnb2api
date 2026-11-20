@@ -25,6 +25,7 @@
     "SECURITY.md",
     "icon.svg",
     "LICENSE",
+    "docs/",
     "tools/"
   ],
   "author": "ikoude",
