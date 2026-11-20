@@ -241,23 +241,32 @@ console.log('\n[11] 停机且额度归零：徽标说"无额"，不能被"停止
   world.usedMilli = 300000;
 }
 
-console.log('\n[12] 版面：没地址的状态行要撑够宽，credits 才落到第二行');
+console.log('\n[12] 版面：workspace 行撑到约 450px，credits 才落到第二行');
 {
-  // 面板把两个窗口排进一行 flex，放得下就并排。"已停止"太短，
-  // credits 会被拽回同一行，四个账号一会儿一行一会儿两行。
-  world.status = 'closed'; world.chargeStatus = 200; world.usedMilli = 300000; world.alive = true;
-  const { plugin, auth } = await boot();
-  const out = await plugin.auth.usage(async () => auth);
-  const ws = (out.windows || []).find((w) => w.name === 'workspace');
-  ok(/\u3000{20,}$/.test(ws?.display || ''), `短行末尾补全角空格，实际 ${JSON.stringify(ws?.display)}`);
+  // 面板把两个窗口排进一行 flex，换行只由宽度决定。"已停止"太短、
+  // 带地址的那行也不够宽，credits 就会被拽回同一行——四个账号一会儿一行
+  // 一会儿两行。所以无论长短都补全角空格撑到 450px（面板 10.5px 字号）。
+  const width = (s) => [...String(s ?? '')].reduce((n, ch) => n + (ch.charCodeAt(0) > 0x2e7f ? 10.5 : 5.8), 0);
 
-  // 有地址时本来就超宽，不该再补——补了会溢出卡片
+  world.status = 'closed'; world.chargeStatus = 200; world.usedMilli = 300000; world.alive = true;
+  {
+    const { plugin, auth } = await boot();
+    const out = await plugin.auth.usage(async () => auth);
+    const ws = (out.windows || []).find((w) => w.name === 'workspace');
+    ok(/\u3000{20,}$/.test(ws?.display || ''), `短行末尾补全角空格，实际 ${JSON.stringify(ws?.display)}`);
+    ok(width(ws?.display) >= 445 && width(ws?.display) <= 465, `短行补到 ~450px，实际 ${width(ws?.display).toFixed(0)}px`);
+  }
+
+  // 带地址的行也要撑：实测卡片宽到 736px 时，这行不撑就会和 credits 并排
   world.status = 'running'; world.alive = true;
-  const { plugin: p2, auth: a2 } = await boot();
-  const out2 = await p2.auth.usage(async () => a2);
-  const ws2 = (out2.windows || []).find((w) => w.name === 'workspace');
-  ok(/^就绪 · /.test(ws2?.display || ''), `有地址时不补空格，实际 ${JSON.stringify(ws2?.display)}`);
-  ok(!/\u3000/.test(ws2?.display || ''), '有地址的行不留全角空格');
+  {
+    const { plugin, auth } = await boot();
+    const out = await plugin.auth.usage(async () => auth);
+    const ws = (out.windows || []).find((w) => w.name === 'workspace');
+    ok(/^就绪 · /.test(ws?.display || ''), `地址照旧可读，实际 ${JSON.stringify(ws?.display)}`);
+    ok(width(ws?.display) >= 445 && width(ws?.display) <= 465, `带地址的行同样补到 ~450px，实际 ${width(ws?.display).toFixed(0)}px`);
+  }
+
 }
 
 summary();

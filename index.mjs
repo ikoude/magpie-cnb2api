@@ -786,6 +786,25 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return '识别中';
   }
 
+  // 面板的额度行是一行 flex：两个窗口放得下就并排，放不下才换行。
+  // 换行只由宽度决定，窗口里塞不进换行符，插件也注入不了 CSS（插件页面是
+  // sandbox iframe），所以想让第二个窗口稳定落到第二行，只能把第一行自己
+  // 撑宽。补的是全角空格（U+3000 不参与 CSS 空白折叠）：卡片更窄时它只是
+  // 被裁掉，看不出空白；卡片更宽时可能又并回一行，那是这个做法固有的边界。
+  // 450px 是按面板 10.5px 字号估的：常见卡片 570-780px，加上 credits 那一块
+  // （约 280-300px）后刚好放不下；而 workspace 行自己（含名字约 510px）在
+  // 最窄的 570px 卡片里还留着余量，不会顶出横向滚动。
+  const PAD_ROW_PX = 450;
+  function textWidth(s) {
+    let w = 0;
+    for (const ch of String(s)) w += ch.charCodeAt(0) > 0x2e7f ? 10.5 : 5.8;
+    return w;
+  }
+  function padRow(s) {
+    const need = PAD_ROW_PX - textWidth(s);
+    return need > 0 ? s + '\u3000'.repeat(Math.ceil(need / 10.5)) : s;
+  }
+
   // 徽标（账号名后那枚小字，magpie 的 plan 字段）：回答"现在卡在哪一环"。
   // 它不是工作区状态的同义词，也不是一句笼统的"能不能用"——单个词只能答一件事，
   // 所以取**最卡住你的那一环**，按下面的优先顺序（前一条压住后一条）：
@@ -2369,14 +2388,12 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
           if (process.env.CNB2API_SHOW_FULL_HOST === '1' && alive && host) {
             wsRow.display = wsRow.display.replace(maskHost(host), host);
           }
-          // 版面：面板把两个窗口排进一行 flex，放得下就并排。没有地址的状态行很
-          // 短（"已停止"），credits 于是又被拽回同一行——四个账号一会儿一行、
-          // 一会儿两行。窗口里塞不进换行符，只能用全角空格把首行撑到放不下，
-          // 让 credits 稳定落到第二行；有地址时本来就超宽，不必撑。
-          // 门槛压在 12 字以内：更长的文案（"不可用 · 具体原因"）自己就够宽。
-          if (!(alive && host) && [...wsRow.display].length <= 12) {
-            wsRow.display += '\u3000'.repeat(24);
-          }
+          // 版面：面板把两个窗口排进一行 flex（.acc .aq，放得下就并排），
+          // 换行只由宽度决定。想让 credits 稳定落到第二行，只能让首行自己先
+          // 占掉大半个卡片——用全角空格把 workspace 行补到 PAD_ROW_PX 宽。
+          // 补的是不可见字符：卡片更窄时它只是被裁掉，不会露出空白；
+          // 卡片更宽时才可能又并回一行（见 README 6.1 的说明）。
+          wsRow.display = padRow(wsRow.display);
           // 版面收尾：workspace → AI credits → 补充说明 → dev core-hours → 明细。
           // 前两位是面板那两行（工作区状态、credits），核时与明细不进可视区，
           // 但仍随 /quotas 返回，终端 magpie quota 与悬停提示照旧能读到。
