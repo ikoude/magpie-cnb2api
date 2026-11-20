@@ -71,6 +71,15 @@ magpie quota
 安装完成后，magpie 的 **Plugins** 列表中出现 **CNB2API**。首次登录需要准备两项凭据，
 区别见 [5.1 两类凭据](#51-两类凭据)。
 
+未发布到 npm 时，可以直接从仓库或本地目录安装：
+
+```bash
+magpie plugin add github:<账号>/magpie-cnb2api   # 从 GitHub
+magpie plugin add ./magpie-cnb2api               # 从本地克隆
+```
+
+两者装的是同一份 `index.mjs`，之后 `magpie plugin update` 拉取仓库最新提交。
+
 ---
 
 ## 3. 概念
@@ -302,11 +311,11 @@ PROXY_KEY 的粒度是**仓库**，不是账号，也不是网关：
 
 ```
 alice | acme/gateway      无额  ⟳                         首选
-   workspace    已停止 · main · 实例 cnb-89v-1k7o3utfv
+   workspace    已停止 · main · 实例 cnb-7xk-1a2b3c4d5
    AI credits   ▬▬▬▬▬  1200 / 1200 cr · 已用 100%
 
 alice | beta/gateway      可用  ⟳                       设为首选
-   workspace    就绪 · 1a2b****-9001.cnb.run · main · 实例 cnb-62f-1k7qq32lc · 运行 8h
+   workspace    就绪 · 1a2b****-9001.cnb.run · main · 实例 cnb-9mq-5f6g7h8j9 · 运行 8h
    AI credits   ▬        800 / 1200 cr · 已用 67%
 ```
 
@@ -376,8 +385,8 @@ alice | beta/gateway      可用  ⟳                       设为首选
 `未建` 只在这个仓库**一条工作区记录都没有**时出现（额度同时归零时会先说 `无额`），
 判断依据是
 `/workspace/list` 的**全量**结果（不带 `slug` 参数）。服务端那个 `slug` 过滤会漏记录：
-2026-11-20 实测 `ikelaode/cnb2api` 在平台上共 5 条（1 running + 4 closed），
-`?slug=ikelaode/cnb2api` 只回 1 条 —— 那 4 条的 `repo_url` 指向别的组织，被服务端当成
+2026-11-20 实测 `acme/cnb2api` 在平台上共 5 条（1 running + 4 closed），
+`?slug=acme/cnb2api` 只回 1 条 —— 那 4 条的 `repo_url` 指向别的组织，被服务端当成
 "不属于这个 slug"滤掉了。该组织一旦没有 running 实例，列表就是空的，插件就会误判
 "从未建过"、面板显示 `未建`。所以现在拉全量、自己按仓库筛（`slug` 优先，缺了退回 `repo_url`）。
 
@@ -640,7 +649,7 @@ npx magpie-cnb2api-prune --apply    # 执行，自动备份
 源码为单个 `index.mjs`，按「纯函数 → 账号作用域 → CNB OpenAPI → 状态机 → 登录流程 → 宿主协议」分段，文件头有索引。无运行时依赖，要求 Node ≥ 20。
 
 ```bash
-npm test     # 6 个测试文件，各自独立进程
+npm test     # 8 个测试文件，各自独立进程
 ```
 
 | 文件 | 覆盖内容 |
@@ -651,8 +660,11 @@ npm test     # 6 个测试文件，各自独立进程
 | `test/quota-gate.test.mjs` | 额度用尽不启动、结论缓存、402 翻译、额度恢复后补启动 |
 | `test/usage.test.mjs` | 面板不被启动与探活拖住、查不到额度时写明原因、可视区头两行是 workspace 与 AI credits |
 | `test/ready-retry.test.mjs` | 工作区停止后等到新地址再重试 |
+| `test/prune.test.mjs` | 清理工具识别孤儿账号、同组织多账号告警、`--apply` 不动授权表 |
+| `test/scope.test.mjs` | 源码形态约束：`refresh()` 不返回 Proxy、`then` 不被作用域外解包 |
 
 测试以假的 `fetch` 替代网络，不访问 CNB，也不读写 `~/.config/magpie`；`test/` 不包含在 npm 包内。
+CI 在 Node 20 与 22 上各跑一遍（`.github/workflows/test.yml`）。
 
 ---
 

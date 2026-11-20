@@ -647,8 +647,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
 
   // 工作区列表。**不要给服务端传 slug**：它的 slug 过滤会漏记录。
   //
-  // 实测（2026-11-20）：ikelaode/cnb2api 在平台上共 5 条记录
-  // （1 running + 4 closed），但 `?slug=ikelaode/cnb2api` 只回 1 条 —— 那 4 条
+  // 实测（2026-11-20）：acme/cnb2api 在平台上共 5 条记录
+  // （1 running + 4 closed），但 `?slug=acme/cnb2api` 只回 1 条 —— 那 4 条
   // 的 repo_url 指向 qdirs，服务端把它们当成"不属于这个 slug"滤掉了。
   // 后果很直接：该组织没有 running 实例时列表就是空的，插件据此判"从没建过"，
   // 面板上显示"未建"，而实际上这些实例一直在，只是全处于 stopped。

@@ -214,7 +214,7 @@ console.log('\n[9] 仓库里没有工作区：徽标"未建"，不是英文 none
 
 console.log('\n[10] 列表不带 slug：服务端的 slug 过滤会漏掉已停止的实例');
 {
-  // 实测 ?slug=ikelaode/cnb2api 只回 1 条，而平台上该仓库有 5 条 ——
+  // 实测 ?slug=acme/cnb2api 只回 1 条，而平台上该仓库有 5 条 ——
   // 漏掉的都是 closed 实例，插件于是误判"从未建过"，面板显示"未建"。
   world.status = 'closed'; world.empty = false; world.chargeStatus = 200; world.listQuery = '';
   const { plugin, auth } = await boot();

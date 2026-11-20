@@ -1,3 +1,9 @@
 node_modules/
 *.tgz
 .DS_Store
+
+# 本地调试与凭据，永不入库
+.env
+.env.*
+*.log
+coverage/
