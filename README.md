@@ -647,7 +647,7 @@ npx magpie-cnb2api-prune --apply    # 执行，自动备份
 源码为单个 `index.mjs`，按「纯函数 → 账号作用域 → CNB OpenAPI → 状态机 → 登录流程 → 宿主协议」分段，文件头有索引。无运行时依赖，要求 Node ≥ 20。
 
 ```bash
-npm test     # 8 个测试文件，各自独立进程
+npm test     # 9 个测试文件，各自独立进程
 ```
 
 | 文件 | 覆盖内容 |
@@ -660,9 +660,25 @@ npm test     # 8 个测试文件，各自独立进程
 | `test/ready-retry.test.mjs` | 工作区停止后等到新地址再重试 |
 | `test/prune.test.mjs` | 清理工具识别孤儿账号、同组织多账号告警、`--apply` 不动授权表 |
 | `test/scope.test.mjs` | 源码形态约束：`refresh()` 不返回 Proxy、`then` 不被作用域外解包 |
+| `test/manifest.test.mjs` | 清单自检：入口与 `magpie` 字段、图标两处一致、`files` 范围、`bin` 可执行 |
 
-测试以假的 `fetch` 替代网络，不访问 CNB，也不读写 `~/.config/magpie`；`test/` 不包含在 npm 包内。
+测试以假的 `fetch` 替代网络，不访问 CNB，也不读写 `~/.config/magpie`。
 CI 在 Node 20 与 22 上各跑一遍（`.github/workflows/test.yml`）。
+
+仓库里每个文件的去向：
+
+| 路径 | 作用 | 进 npm 包 |
+|---|---|---|
+| `index.mjs` | 插件本体，magpie 只加载它 | 是 |
+| `package.json` | 清单与 `magpie` 字段（名称、图标、选项默认值） | 是 |
+| `README.md` / `CHANGELOG.md` / `LICENSE` | 文档与许可 | 是 |
+| `icon.svg` | `magpie.icon` 的源文件——包里那个值是它的 base64 | 是 |
+| `tools/magpie-prune.mjs` | 清理脚本，经 `bin` 暴露为 `magpie-cnb2api-prune` | 是 |
+| `test/` | 只给本地与 CI 用，`files` 字段已排除 | 否 |
+| `.github/` / `.gitignore` | CI 与忽略规则 | 否 |
+
+改图标要同步两处：`icon.svg` 与 `package.json` 里 `magpie.icon` 的 base64（宿主只读后者，
+文件不被加载）。`test/manifest.test.mjs` 会比对两者，只改一处 CI 会红。
 
 ---
 
