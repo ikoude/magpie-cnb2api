@@ -89,7 +89,7 @@ console.log('\n[1] 工作区已停止 + start 很慢：usage 不能等它');
   ok(!!credit, '额度卡片有 AI credits 行');
   ok(credit && credit.used != null, `额度带读数 used=${credit?.used}`);
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
-  ok(plain(ws?.display) === '已停止', `workspace 行只说状态，实际 ${ws?.display}`);
+  ok(/^已停止 · main · 实例 sn-1$/.test(plain(ws?.display)), `workspace 行说状态与实例，实际 ${ws?.display}`);
   // 账号名后的徽标（plan）一律两字中文：字数一样宽度才一样，
   // 四个账号的徽标才会落在同一列上。
   ok(out.plan === '停止', `徽标是两字中文，实际 ${out.plan}`);
@@ -177,7 +177,7 @@ console.log('\n[7] 额度打满且工作区已停：说明不会自动启动');
   const { plugin, auth } = await boot();
   const out = await plugin.auth.usage(async () => auth);
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
-  ok(plain(ws?.display) === '已停止', `只给状态词，实际 ${ws?.display}`);
+  ok(/^已停止 · main · 实例 sn-1$/.test(plain(ws?.display)), `状态词后跟实例，实际 ${ws?.display}`);
   const credit2 = (out.windows || []).find((w) => w.name === 'AI credits');
   ok(/^已用尽 · /.test(credit2?.display || ''), `额度行点明已用尽，实际 ${credit2?.display}`);
   const det2 = (out.windows || []).find((w) => w.name === 'AI credits 明细');
@@ -221,7 +221,7 @@ console.log('\n[10] 列表不带 slug：服务端的 slug 过滤会漏掉已停�
   const out = await plugin.auth.usage(async () => auth);
   ok(!/[?&]slug=/.test(world.listQuery), `列表不带 slug，实际 ${world.listQuery}`);
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
-  ok(plain(ws?.display) === '已停止', `别的仓库的 running 不冒充本仓库，实际 ${ws?.display}`);
+  ok(/^已停止 · /.test(plain(ws?.display)), `别的仓库的 running 不冒充本仓库，实际 ${ws?.display}`);
   ok(out.plan === '停止', `徽标跟着本仓库走，实际 ${out.plan}`);
 }
 
@@ -235,17 +235,18 @@ console.log('\n[11] 停机且额度归零：徽标说"无额"，不能被"停止
   const out = await plugin.auth.usage(async () => auth);
   ok(out.plan === '无额', `额度耗尽压过停机，实际 ${out.plan}`);
   const ws = (out.windows || []).find((w) => w.name === 'workspace');
-  ok(plain(ws?.display) === '已停止', `工作区状态照实写，实际 ${ws?.display}`);
+  ok(/^已停止 · /.test(plain(ws?.display)), `工作区状态照实写，实际 ${ws?.display}`);
   const credit = (out.windows || []).find((w) => w.name === 'AI credits');
   ok(/^已用尽/.test(credit?.display || ''), `额度行写明已用尽，实际 ${credit?.display}`);
   world.usedMilli = 300000;
 }
 
-console.log('\n[12] 版面：workspace 行撑到约 450px，credits 才落到第二行');
+console.log('\n[12] 版面：workspace 行先用真数据占位，再补到约 800px');
 {
-  // 面板把两个窗口排进一行 flex，换行只由宽度决定。"已停止"太短、
-  // 带地址的那行也不够宽，credits 就会被拽回同一行——四个账号一会儿一行
-  // 一会儿两行。所以无论长短都补全角空格撑到 450px（面板 10.5px 字号）。
+  // 面板把两个窗口排进一行 flex，换行只由宽度决定，窗口里塞不进换行符。
+  // 所以状态行要够宽：先写平台真数据（分支、实例、已运行），剩下的用
+  // 全角空格补到 800px。主窗口 1186pt 时卡片约 860px、credits 约 310px，
+  // 状态行得超过 510px 才换行，800px 留了三成余量。
   const width = (s) => [...String(s ?? '')].reduce((n, ch) => n + (ch.charCodeAt(0) > 0x2e7f ? 10.5 : 5.8), 0);
 
   world.status = 'closed'; world.chargeStatus = 200; world.usedMilli = 300000; world.alive = true;
@@ -253,20 +254,22 @@ console.log('\n[12] 版面：workspace 行撑到约 450px，credits 才落到第
     const { plugin, auth } = await boot();
     const out = await plugin.auth.usage(async () => auth);
     const ws = (out.windows || []).find((w) => w.name === 'workspace');
+    const text = plain(ws?.display);
+    ok(/^已停止 · main · 实例 sn-1$/.test(text), `停机也说清楚是哪个实例，实际 ${JSON.stringify(text)}`);
     ok(/\u3000{20,}$/.test(ws?.display || ''), `短行末尾补全角空格，实际 ${JSON.stringify(ws?.display)}`);
-    ok(width(ws?.display) >= 445 && width(ws?.display) <= 465, `短行补到 ~450px，实际 ${width(ws?.display).toFixed(0)}px`);
+    ok(width(ws?.display) >= 795 && width(ws?.display) <= 815, `短行补到 ~800px，实际 ${width(ws?.display).toFixed(0)}px`);
   }
 
-  // 带地址的行也要撑：实测卡片宽到 736px 时，这行不撑就会和 credits 并排
+  // 在跑的行：地址、分支、实例、已运行，一段都不少，且同样补到 800px
   world.status = 'running'; world.alive = true;
   {
     const { plugin, auth } = await boot();
     const out = await plugin.auth.usage(async () => auth);
     const ws = (out.windows || []).find((w) => w.name === 'workspace');
-    ok(/^就绪 · /.test(ws?.display || ''), `地址照旧可读，实际 ${JSON.stringify(ws?.display)}`);
-    ok(width(ws?.display) >= 445 && width(ws?.display) <= 465, `带地址的行同样补到 ~450px，实际 ${width(ws?.display).toFixed(0)}px`);
+    const text = plain(ws?.display);
+    ok(/^就绪 · .+ · main · 实例 sn-1 · 运行 \S+$/.test(text), `地址、分支、实例、运行时长都在，实际 ${JSON.stringify(text)}`);
+    ok(width(ws?.display) >= 795 && width(ws?.display) <= 815, `带地址的行同样补到 ~800px，实际 ${width(ws?.display).toFixed(0)}px`);
   }
-
 }
 
 summary();

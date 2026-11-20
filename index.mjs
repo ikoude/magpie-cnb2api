@@ -411,6 +411,10 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       uri: null,
       sn: null,
       status: null,
+      // 工作区自己的分支与创建时间：状态行里当"真数据"用（分支照实说，
+      // 创建时间算已运行多久），比补空白更值得占位置
+      branch: '',
+      wsAt: 0,
       lastError: null,
       lastCheck: 0,
       starting: false,
@@ -760,41 +764,75 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
     return `AI credits 已用尽 · 已用 ${used} / ${num1(c.total)} cr${frozen} · 恢复后自动启动`;
   }
 
-  // workspace 行的唯一说法：<状态词> · <地址 / 原因>
+  // workspace 行的唯一说法：<状态词> · <地址> · <分支> · <实例> · <已运行>
   // 一行只讲一件事：工作区在不在、地址通不通。额度一律留给它下面那行
   // （AI credits / dev core-hours），因此这里不出现任何额度话术，避免两行重复。
   //   就绪（在跑、地址通、额度够） · 运行中（在跑，但额度已归零）
   //   无响应（在跑但地址不通）     · 已停止 / 无工作区 / 启动中
   //   识别中（首屏还没查到）       · 不可用（令牌、权限、仓库这类硬失败）
+  //
+  // 状态词后面跟的全是平台给的真数据，不是补白：分支、实例编号（报障时报这个）、
+  // 已运行多久。它们同时把这一行撑到需要的宽度（见 padRow 的说明），
+  // 于是一个字的功效有两份：既说清是哪个工作区，也让下一行落到下一行。
+  // 只到小时：分钟那一截既没人看，又会把行尾顶出卡片（窄卡片会裁掉半句）
+  function uptimeText(since) {
+    if (!since) return '';
+    const min = Math.max(0, Math.round((Date.now() - since) / 60000));
+    const h = Math.floor(min / 60);
+    const d = Math.floor(h / 24);
+    if (d > 0) return `${d}d${h % 24}h`;
+    if (h > 0) return `${h}h`;
+    return `${min}m`;
+  }
+
+  // 工作区的"身份证"：分支 + 实例编号，能拿到才写，缺一个就少一段
+  function wsFacts() {
+    const out = [];
+    if (state.branch) out.push(state.branch);
+    if (state.sn) out.push(`实例 ${state.sn}`);
+    return out;
+  }
+
   function workspaceLine(alive, creditDead) {
     const host = state.uri ? maskHost(hostOf(state.uri)) : '';
-    const tail = host ? ` · ${host}` : '';
+    const st = state.status;
     // 额度归零时用"运行中"而不是"就绪"：机器在跑，但这个账号用不了。
     // 为什么用不了，看下一行的 AI credits（那里会写"已用尽"）。
-    if (alive) return creditDead ? `运行中${tail}` : `就绪${tail}`;
-    const st = state.status;
-    if (st === 'running') return `无响应${tail}`;
+    if (alive) {
+      const run = uptimeText(state.wsAt);
+      const parts = [creditDead ? '运行中' : '就绪'];
+      if (host) parts.push(host);
+      parts.push(...wsFacts());
+      if (run) parts.push(`运行 ${run}`);
+      return parts.join(' · ');
+    }
+    if (st === 'running') return ['无响应', host, ...wsFacts()].filter(Boolean).join(' · ');
     // 硬失败优先：仓库不存在、令牌无效这类原因比"没工作区"更重要
     if (state.fatal) return `不可用 · ${state.lastError || '原因未知'}`;
     if (st === 'closed' || st === 'none' || st === 'building') {
       const word = st === 'closed' ? '已停止' : st === 'none' ? '无工作区' : '启动中';
-      if (state.recovering) return `${word} · ${st === 'none' ? '正在创建' : '正在自动启动'}`;
-      return word;
+      if (state.recovering) {
+        const how = st === 'none' ? '正在创建' : '正在自动启动';
+        return `${word} · ${how}`;
+      }
+      return [word, ...wsFacts()].join(' · ');
     }
     // 非致命错误只在给不出状态词时才占整行；"识别中"留给后台，1 秒内就会变
     if (state.lastError) return `不可用 · ${state.lastError}`;
     return '识别中';
   }
 
-  // 面板的额度行是一行 flex：两个窗口放得下就并排，放不下才换行。
-  // 换行只由宽度决定，窗口里塞不进换行符，插件也注入不了 CSS（插件页面是
-  // sandbox iframe），所以想让第二个窗口稳定落到第二行，只能把第一行自己
-  // 撑宽。补的是全角空格（U+3000 不参与 CSS 空白折叠）：卡片更窄时它只是
-  // 被裁掉，看不出空白；卡片更宽时可能又并回一行，那是这个做法固有的边界。
-  // 450px 是按面板 10.5px 字号估的：常见卡片 570-780px，加上 credits 那一块
-  // （约 280-300px）后刚好放不下；而 workspace 行自己（含名字约 510px）在
-  // 最窄的 570px 卡片里还留着余量，不会顶出横向滚动。
-  const PAD_ROW_PX = 450;
+  // 面板把两个窗口排进一行 flex（.acc .aq），放得下就并排、放不下才换行；
+  // 窗口里塞不进换行符，插件也注入不了 CSS（插件页面是 sandbox iframe）。
+  // 所以想让 AI credits 稳定落到第二行，只能让第一行自己够宽：状态行先用
+  // 真数据（地址、分支、实例、已运行）撑一段，剩下的用 U+3000 补到 PAD_ROW_PX。
+  // U+3000 不参与 CSS 空白折叠，卡片更窄时它只是被 .accts 的 overflow:hidden
+  // 裁掉，看不出痕迹；卡片宽到连 PAD_ROW_PX 都放得下时才会并回一行。
+  //
+  // 800px 是按面板 10.5px 字号、主窗口 1186pt 估的：此时卡片约 860px，
+  // credits 那一段约 310px，状态行要超过 510px 才会换行；带地址与实例的行
+  // 自己就有 490px 左右，补到 800px 留了三成余量。
+  const PAD_ROW_PX = 800;
   function textWidth(s) {
     let w = 0;
     for (const ch of String(s)) w += ch.charCodeAt(0) > 0x2e7f ? 10.5 : 5.8;
@@ -1032,6 +1070,10 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       const ws = await pickWorkspace();
       if (!ws) {
         state.status = 'none';
+        // 没有实例就没有编号、分支、起始时间，别把上一次的留在状态行里
+        state.sn = null;
+        state.branch = '';
+        state.wsAt = 0;
         // 先确认这个仓库到底存不存在：填错名字时不该反复尝试启动
         if (!(await repoExists(cfg.repo))) {
           state.lastError = `仓库 ${cfg.repo} 不存在或令牌无权访问`;
@@ -1046,6 +1088,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       }
       state.sn = ws.sn;
       state.status = ws.status;
+      state.branch = ws.branch || cfg.branch || '';
+      state.wsAt = Date.parse(ws.create_time || '') || 0;
 
       if (ws.status !== 'running') {
         state.lastError = '工作区已停止';
@@ -1477,6 +1521,8 @@ export const Cn2ApiPlugin = async ({ client, options: pluginOptions }) => {
       state.uri = null;
       state.sn = null;
       state.status = null;
+      state.branch = '';
+      state.wsAt = 0;
       state.lastError = null;
       state.fatal = false;        // ← 之前永不重置，改好配置也得重启
       state.repoTried = false;    // 允许重新自动发现仓库
