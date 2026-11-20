@@ -17,10 +17,19 @@
   "files": [
     "index.mjs",
     "README.md",
+    "CHANGELOG.md",
     "icon.svg",
     "LICENSE",
     "tools/"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ikoude/magpie-cnb2api.git"
+  },
+  "homepage": "https://github.com/ikoude/magpie-cnb2api",
+  "bugs": {
+    "url": "https://github.com/ikoude/magpie-cnb2api/issues"
+  },
   "keywords": [
     "magpie",
     "magpie-plugin",

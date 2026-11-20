@@ -1,5 +1,8 @@
 # magpie-cnb2api
 
+[![test](https://github.com/ikoude/magpie-cnb2api/actions/workflows/test.yml/badge.svg)](https://github.com/ikoude/magpie-cnb2api/actions/workflows/test.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 把 CNB 工作区中运行的 cnb2api 接入 magpie，作为一个供应商（provider）。安装后，
 magpie 中新增名为 **CNB2API** 的供应商，所有 agent 均可直接选用，行为与内置供应商一致。
 
@@ -57,8 +60,8 @@ cnb2api 运行在 CNB 工作区内，存在两个固有约束：
 需要 magpie 与本机 Node ≥ 20（插件无第三方依赖，不装任何包）。
 
 ```bash
-# 1. 安装（从仓库；本地克隆则用 ./magpie-cnb2api）
-magpie plugin add github:<账号>/magpie-cnb2api
+# 1. 安装（本地克隆则用 ./magpie-cnb2api）
+magpie plugin add github:ikoude/magpie-cnb2api
 
 # 2. 登录（按提示填写令牌、选择组织与仓库、填写 PROXY_KEY）
 magpie plugin login cnb2api
@@ -665,4 +668,4 @@ CI 在 Node 20 与 22 上各跑一遍（`.github/workflows/test.yml`）。
 
 ## License
 
-MIT
+MIT。版本与改动见 [CHANGELOG.md](CHANGELOG.md)。
