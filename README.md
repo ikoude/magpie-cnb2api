@@ -660,7 +660,7 @@ npm test     # 9 个测试文件，各自独立进程
 | `test/ready-retry.test.mjs` | 工作区停止后等到新地址再重试 |
 | `test/prune.test.mjs` | 清理工具识别孤儿账号、同组织多账号告警、`--apply` 不动授权表 |
 | `test/scope.test.mjs` | 源码形态约束：`refresh()` 不返回 Proxy、`then` 不被作用域外解包 |
-| `test/manifest.test.mjs` | 清单自检：入口与 `magpie` 字段、图标两处一致、`files` 范围、`bin` 可执行 |
+| `test/manifest.test.mjs` | 清单自检：入口与 `magpie` 字段、图标两处一致、`files` 范围、`bin` 可执行、发布目标 |
 
 测试以假的 `fetch` 替代网络，不访问 CNB，也不读写 `~/.config/magpie`。
 CI 在 Node 20 与 22 上各跑一遍（`.github/workflows/test.yml`）。
@@ -679,6 +679,15 @@ CI 在 Node 20 与 22 上各跑一遍（`.github/workflows/test.yml`）。
 
 改图标要同步两处：`icon.svg` 与 `package.json` 里 `magpie.icon` 的 base64（宿主只读后者，
 文件不被加载）。`test/manifest.test.mjs` 会比对两者，只改一处 CI 会红。
+
+发布到 npm：
+
+```bash
+npm publish            # publishConfig 已固化官方源与 public，本机 registry 是镜像也不影响
+npm version patch -m "0.1.1" && git push --follow-tags   # 之后发新版
+```
+
+发布前需要的只是 `npm login`（账号与 OTP 由发布者本人提供），包内不含测试、凭据与调试文件。
 
 ---
 

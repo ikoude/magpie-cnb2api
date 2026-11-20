@@ -42,4 +42,12 @@ console.log('\n[4] bin 指向的文件存在');
   ok(readFileSync(path.join(root, bin), 'utf8').startsWith('#!'), `${bin} 有 shebang，能直接执行`);
 }
 
+console.log('\n[5] 发布目标：本机 registry 常是镜像，发布必须走官方源');
+{
+  ok(pkg.publishConfig?.registry === 'https://registry.npmjs.org/',
+    `publishConfig 指向 npm 官方源，实际 ${pkg.publishConfig?.registry}`);
+  ok(pkg.publishConfig?.access === 'public', '公开发布，不带 access 的 scoped 包默认私有');
+  ok(!pkg.private, 'private 未置 true，否则 npm publish 会拒绝');
+}
+
 summary();
