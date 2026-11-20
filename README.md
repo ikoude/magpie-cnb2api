@@ -54,9 +54,11 @@ cnb2api 运行在 CNB 工作区内，存在两个固有约束：
 
 ## 2. 快速开始
 
+需要 magpie 与本机 Node ≥ 20（插件无第三方依赖，不装任何包）。
+
 ```bash
-# 1. 安装
-magpie plugin add npm:magpie-cnb2api
+# 1. 安装（从仓库；本地克隆则用 ./magpie-cnb2api）
+magpie plugin add github:<账号>/magpie-cnb2api
 
 # 2. 登录（按提示填写令牌、选择组织与仓库、填写 PROXY_KEY）
 magpie plugin login cnb2api
@@ -69,16 +71,9 @@ magpie quota
 ```
 
 安装完成后，magpie 的 **Plugins** 列表中出现 **CNB2API**。首次登录需要准备两项凭据，
-区别见 [5.1 两类凭据](#51-两类凭据)。
+区别见 [5.1 两类凭据](#51-两类凭据)。仓库发布到 npm 后也可以 `magpie plugin add npm:magpie-cnb2api`；
+两种来源装的是同一份 `index.mjs`，之后 `magpie plugin update` 拉取最新版本。
 
-未发布到 npm 时，可以直接从仓库或本地目录安装：
-
-```bash
-magpie plugin add github:<账号>/magpie-cnb2api   # 从 GitHub
-magpie plugin add ./magpie-cnb2api               # 从本地克隆
-```
-
-两者装的是同一份 `index.mjs`，之后 `magpie plugin update` 拉取仓库最新提交。
 
 ---
 
